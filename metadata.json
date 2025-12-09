@@ -1,0 +1,5 @@
+{
+  "name": "WABO Flow - EEG Meditation Monitor",
+  "description": "A consumer-grade meditation monitoring application visualizing Alpha waves and relaxation states using WABO TECH algorithms.",
+  "requestFramePermissions": []
+}
