@@ -98,7 +98,9 @@ export class DeviceService {
     this.agitationLevel = 0;
     
     // Listen to motion
-    window.addEventListener('devicemotion', this.handleMotion);
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('devicemotion', this.handleMotion);
+    }
     
     // Start data generation loop
     if (this.simulationInterval) clearInterval(this.simulationInterval);
@@ -108,7 +110,9 @@ export class DeviceService {
   // Stop Simulation Mode
   public stopSimulation() {
     this.isSimulating = false;
-    window.removeEventListener('devicemotion', this.handleMotion);
+    if (typeof window !== 'undefined' && window.removeEventListener) {
+      window.removeEventListener('devicemotion', this.handleMotion);
+    }
     
     if (this.simulationInterval) {
       clearInterval(this.simulationInterval);
@@ -116,6 +120,7 @@ export class DeviceService {
     }
     
     this.lastAcceleration = null;
+    this.agitationLevel = 0;
     
     // Reset data
     this.latestData = {
@@ -127,35 +132,50 @@ export class DeviceService {
 
   // Handle device motion to calculate agitation/stability
   private handleMotion = (event: DeviceMotionEvent) => {
-    const acc = event.accelerationIncludingGravity;
-    if (!acc || acc.x === null || acc.y === null || acc.z === null) return;
+    // Prefer pure acceleration (without gravity) for shake detection
+    let x = event.acceleration?.x;
+    let y = event.acceleration?.y;
+    let z = event.acceleration?.z;
+
+    // Fallback to including gravity if hardware requires (though less accurate for pure shaking)
+    if (x === null || y === null || z === null) {
+       x = event.accelerationIncludingGravity?.x ?? 0;
+       y = event.accelerationIncludingGravity?.y ?? 0;
+       z = event.accelerationIncludingGravity?.z ?? 0;
+    }
+
+    if (x === null || y === null || z === null) return;
 
     if (this.lastAcceleration) {
-      const delta = Math.abs(acc.x - this.lastAcceleration.x) + 
-                    Math.abs(acc.y - this.lastAcceleration.y) + 
-                    Math.abs(acc.z - this.lastAcceleration.z);
+      const delta = Math.abs(x - this.lastAcceleration.x) + 
+                    Math.abs(y - this.lastAcceleration.y) + 
+                    Math.abs(z - this.lastAcceleration.z);
       
       // Increase agitation based on movement intensity
-      // Sensitivity factor can be adjusted
-      this.agitationLevel += delta * 2; 
+      // High sensitivity: delta of 10-20 (shaking) should spike agitation quickly
+      if (delta > 1.0) {
+         this.agitationLevel += delta * 1.5; 
+      }
     }
-    this.lastAcceleration = { x: acc.x, y: acc.y, z: acc.z };
+    this.lastAcceleration = { x, y, z };
   }
 
   // Generate simulated EEG data based on agitation
   private updateSimulation() {
     // Decay agitation over time (return to calm state)
-    this.agitationLevel = Math.max(0, this.agitationLevel * 0.9);
+    // 0.96 decay rate allows "agitated" state to persist slightly longer for voice prompt to trigger
+    this.agitationLevel = Math.max(0, this.agitationLevel * 0.96);
     
     // Map agitation to relaxation (0-100 scale mapped to 1.0-0.0)
-    // Agitation 0 (Flat) -> Relaxation 1.0
-    // Agitation High (Shaking) -> Relaxation Low
-    const normalizedAgitation = Math.min(this.agitationLevel / 15, 1);
+    // Agitation 0 (Flat) -> Relaxation ~1.0
+    // Agitation High (Shaking > 20) -> Relaxation Low
+    const normalizedAgitation = Math.min(this.agitationLevel / 20, 1);
     const targetRelaxation = 1 - normalizedAgitation;
     
     // Smooth transition for realistic sensor lag feel
     const prevRelaxation = this.latestData.metrics.relaxation || 0.5;
-    const relaxation = prevRelaxation * 0.8 + targetRelaxation * 0.2;
+    // Moving average
+    const relaxation = prevRelaxation * 0.85 + targetRelaxation * 0.15;
     
     const attention = 1 - relaxation;
     const isMeditating = relaxation > MEDITATION_THRESHOLD;
@@ -166,24 +186,27 @@ export class DeviceService {
     
     const random = () => Math.random();
 
+    // Alpha peaks when relaxed
     const alpha = (relaxation * 40) + 10 + (random() * 5); 
+    // Beta peaks when agitated
     const beta = (attention * 30) + 5 + (random() * 5);
     const theta = 10 + random() * 5;
     const delta = 5 + random() * 5;
+    // Gamma peaks when agitated
     const gamma = (attention * 20) + random() * 5;
 
     // Generate Raw Waveform
-    // Meditating: Higher amplitude, slower frequency (Alpha-ish)
-    // Agitated: Lower amplitude fast noise (Beta/Gamma)
+    // Meditating: Higher amplitude, cleaner, slower frequency (Alpha-ish 10Hz)
+    // Agitated: Lower amplitude, jagged, fast noise (Beta/Gamma 25Hz)
     const t = Date.now() / 1000;
     
     let rawValue = 0;
-    if (isMeditating) {
-        // Alpha wave dominance (10Hz approx)
-        rawValue = Math.sin(t * 10 * Math.PI * 2) * 50 + (random() * 10);
+    if (relaxation > 0.7) {
+        // Calm state: Smooth Sine wave (Alpha)
+        rawValue = Math.sin(t * 10 * Math.PI * 2) * 50 + (random() * 8);
     } else {
-        // Beta/Gamma noise
-        rawValue = Math.sin(t * 25 * Math.PI * 2) * 20 + (random() * 40 - 20);
+        // Agitated state: Fast noise
+        rawValue = Math.sin(t * 25 * Math.PI * 2) * 20 + (random() * 40 - 20) + (Math.sin(t * 4) * 10);
     }
 
     this.latestData = {
