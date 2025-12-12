@@ -6,13 +6,14 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Hash } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); // 默认中文
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [isDeviceConnected, setIsDeviceConnected] = useState<boolean>(false);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  const [deviceId, setDeviceId] = useState<string>("123456"); // Device ID for protocol
   
   const [waveData, setWaveData] = useState<EEGDataPoint[]>([]);
   const [bands, setBands] = useState<FrequencyBands>({ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 });
@@ -96,13 +97,14 @@ const App: React.FC = () => {
     }
 
     if (!isDeviceConnected) {
-        const success = await signalProcessor.connect();
+        // Pass the user-entered Device ID to the connection service
+        const success = await signalProcessor.connect(deviceId);
         if (success) {
             setIsDeviceConnected(true);
             handleStartMonitoring();
         } else {
             // 连接失败提示
-            alert("Serial Connection Failed. Please try Simulation Mode if device is not available.");
+            alert("Serial Connection Failed. Ensure your device is connected and ID is correct.");
         }
     } else {
         await signalProcessor.disconnect();
@@ -160,9 +162,9 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-sky-500/30">
       {/* 头部 Header */}
-      <header className="px-6 py-4 flex items-center justify-between bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 border-b border-slate-800">
+      <header className="px-6 py-4 flex flex-col md:flex-row items-center justify-between bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 border-b border-slate-800 gap-4 md:gap-0">
         <WaboLogo />
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center justify-center gap-3">
           {/* 语言切换 */}
           <button 
              onClick={toggleLanguage}
@@ -172,14 +174,21 @@ const App: React.FC = () => {
              <Languages size={20} />
           </button>
 
-          {/* 设备状态指示器 */}
-          <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-slate-800 rounded-lg border border-slate-700">
-            <div className={`w-2 h-2 rounded-full ${isDeviceConnected ? 'bg-green-500 animate-pulse' : 'bg-slate-500'}`} />
-            <span className="text-xs font-mono text-slate-400">
-                {t.device_status}: {isDeviceConnected ? t.connected : t.disconnected}
-            </span>
-          </div>
-          
+          {/* 设备 ID 输入 - 仅当未连接和未模拟时显示 */}
+          {!isDeviceConnected && !isSimulating && (
+            <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
+                <Hash size={14} className="text-slate-500 mr-2" />
+                <input 
+                    type="text" 
+                    value={deviceId}
+                    onChange={(e) => setDeviceId(e.target.value)}
+                    placeholder="ID: 123456"
+                    className="bg-transparent border-none outline-none w-24 text-sm font-mono text-slate-200 placeholder-slate-600 focus:ring-0"
+                    maxLength={6}
+                />
+            </div>
+          )}
+
           {/* 模拟模式按钮 */}
           <button 
             onClick={handleSimulation}
@@ -190,7 +199,7 @@ const App: React.FC = () => {
             }`}
           >
             <Smartphone size={16} />
-            {t.simulate}
+            <span className="hidden sm:inline">{t.simulate}</span>
           </button>
 
           {/* 连接按钮 - 如果正在模拟则禁用或隐藏 */}
