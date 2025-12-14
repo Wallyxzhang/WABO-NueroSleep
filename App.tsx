@@ -1,4 +1,3 @@
-
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { WaboLogo } from './components/Logo';
 import { WaveChart } from './components/WaveChart';
@@ -104,15 +103,17 @@ const App: React.FC = () => {
                 setIsDeviceConnected(true);
                 handleStartMonitoring();
             } else {
-                // 连接失败，不抛出 alert，因为 DeviceService 内部已经处理了大部分错误日志
-                // 但如果用户在不支持的环境点击，给一个友好的提示
-                const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-                if (!navigator.bluetooth && !navigator.serial) {
-                   alert("您的浏览器不支持 Web Bluetooth 或 Web Serial。请使用 Chrome (桌面/Android) 或 Bluefy (iOS)。");
+                // 如果在 iOS 上，提示用户使用 Bluefy
+                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+                if (isIOS && !navigator.bluetooth) {
+                    alert("iOS 系统限制：Safari 和 Chrome 不支持蓝牙连接。\n\n请在 App Store 下载 'Bluefy' 浏览器，并在 Bluefy 中打开此网页进行连接。");
+                } else if (!navigator.bluetooth && !navigator.serial) {
+                   alert("您的浏览器不支持 Web Bluetooth 或 Web Serial。\n请使用 Chrome (桌面/Android) 或 Edge。");
                 }
             }
         } catch (e) {
             console.error("Connection failed", e);
+            alert(`连接错误: ${e instanceof Error ? e.message : String(e)}`);
         }
     } else {
         await signalProcessor.disconnect();
