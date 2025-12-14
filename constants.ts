@@ -1,3 +1,4 @@
+
 export const LOGO_URL = "https://i.imgur.com/example-logo.png"; 
 export const WABO_LOGO_SVG = `
 <svg viewBox="0 0 800 200" fill="none" xmlns="http://www.w3.org/2000/svg" class="h-full w-auto">
@@ -44,8 +45,9 @@ export const TRANSLATIONS = {
     beta_desc: "Beta (专注/紧张)",
     delta_desc: "Delta (深睡)",
     gamma_desc: "Gamma (认知)",
-    simulate: "模拟模式",
+    simulate: "重力感应模拟",
     voice_feedback: "太棒了，你已经进入了冥想状态。",
+    simulation_hint: "平放手机以进入冥想，摇晃手机以模拟波动",
   },
   en: {
     title: "WABO Flow EEG Monitor",
@@ -61,7 +63,7 @@ export const TRANSLATIONS = {
     active_mind: "Active Mind",
     alpha_index: "ALPHA INDEX",
     target_achieved: "Target State Achieved",
-    focus_breath: "Focus on your breath",
+    focus_breath: "Please focus on your breath",
     analysis_title: "Brainwave Analysis",
     relaxation_index: "Relaxation Index",
     attention_index: "Attention Index",
@@ -70,7 +72,8 @@ export const TRANSLATIONS = {
     beta_desc: "Beta (Focus/Stress)",
     delta_desc: "Delta",
     gamma_desc: "Gamma",
-    simulate: "Simulate",
+    simulate: "Motion Sim",
     voice_feedback: "Excellent. You have entered a meditation state.",
+    simulation_hint: "Keep device still to meditate, shake to disrupt.",
   }
 };

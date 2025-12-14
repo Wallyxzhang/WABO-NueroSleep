@@ -1,3 +1,4 @@
+
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { WaboLogo } from './components/Logo';
 import { WaveChart } from './components/WaveChart';
@@ -6,14 +7,13 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Hash } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); // 默认中文
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [isDeviceConnected, setIsDeviceConnected] = useState<boolean>(false);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
-  const [deviceId, setDeviceId] = useState<string>("123456"); // Device ID for protocol
   
   const [waveData, setWaveData] = useState<EEGDataPoint[]>([]);
   const [bands, setBands] = useState<FrequencyBands>({ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 });
@@ -74,37 +74,45 @@ const App: React.FC = () => {
     // 4. 语音反馈逻辑
     const now = Date.now();
     
-    // 状态 1: 进入冥想状态 (Excellent...)
-    // 冷却时间 15s
-    if (packet.metrics.isMeditating && (now - lastVoiceTime.current > 15000) && appState === AppState.RUNNING) {
-      speak(t.voice_feedback);
-      lastVoiceTime.current = now;
-    } 
-    // 状态 2: 摇晃/分心状态 (Focus on breathing...)
-    // 仅在运行中，且非冥想状态，且放松指数较低时触发
-    // 冷却时间 8s
-    else if (!packet.metrics.isMeditating && packet.metrics.relaxation < 0.6 && (now - lastVoiceTime.current > 8000) && appState === AppState.RUNNING) {
-       speak(t.focus_breath);
-       lastVoiceTime.current = now;
+    if (appState === AppState.RUNNING) {
+        // 状态 1: 进入冥想状态
+        // 冷却时间 15s
+        if (packet.metrics.isMeditating && (now - lastVoiceTime.current > 15000)) {
+          speak(t.voice_feedback);
+          lastVoiceTime.current = now;
+        } 
+        // 状态 2: 摇晃/分心状态 (放松指数低)
+        // 冷却时间 8s
+        else if (!packet.metrics.isMeditating && packet.metrics.relaxation < 0.7 && (now - lastVoiceTime.current > 8000)) {
+           speak(t.focus_breath);
+           lastVoiceTime.current = now;
+        }
     }
   };
 
   const handleConnect = async () => {
+    // 如果正在模拟，先切换回正常模式
     if (isSimulating) {
-        // 如果正在模拟，先关闭模拟
-        handleSimulation();
-        return;
+        await handleSimulation();
+        // 继续执行连接逻辑
     }
 
     if (!isDeviceConnected) {
-        // Pass the user-entered Device ID to the connection service
-        const success = await signalProcessor.connect(deviceId);
-        if (success) {
-            setIsDeviceConnected(true);
-            handleStartMonitoring();
-        } else {
-            // 连接失败提示
-            alert("Serial Connection Failed. Ensure your device is connected and ID is correct.");
+        try {
+            const success = await signalProcessor.connect();
+            if (success) {
+                setIsDeviceConnected(true);
+                handleStartMonitoring();
+            } else {
+                // 连接失败，不抛出 alert，因为 DeviceService 内部已经处理了大部分错误日志
+                // 但如果用户在不支持的环境点击，给一个友好的提示
+                const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+                if (!navigator.bluetooth && !navigator.serial) {
+                   alert("您的浏览器不支持 Web Bluetooth 或 Web Serial。请使用 Chrome (桌面/Android) 或 Bluefy (iOS)。");
+                }
+            }
+        } catch (e) {
+            console.error("Connection failed", e);
         }
     } else {
         await signalProcessor.disconnect();
@@ -123,7 +131,7 @@ const App: React.FC = () => {
             setIsDeviceConnected(true);
             handleStartMonitoring();
         } else {
-            alert("Motion sensor permission required for simulation mode.");
+            alert("需要运动传感器权限才能使用模拟模式。\nPermission required for simulation.");
         }
     } else {
         signalProcessor.stopSimulation();
@@ -162,9 +170,9 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans selection:bg-sky-500/30">
       {/* 头部 Header */}
-      <header className="px-6 py-4 flex flex-col md:flex-row items-center justify-between bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 border-b border-slate-800 gap-4 md:gap-0">
+      <header className="px-6 py-4 flex items-center justify-between bg-slate-900/80 backdrop-blur-md sticky top-0 z-50 border-b border-slate-800">
         <WaboLogo />
-        <div className="flex flex-wrap items-center justify-center gap-3">
+        <div className="flex items-center gap-4">
           {/* 语言切换 */}
           <button 
              onClick={toggleLanguage}
@@ -174,21 +182,14 @@ const App: React.FC = () => {
              <Languages size={20} />
           </button>
 
-          {/* 设备 ID 输入 - 仅当未连接和未模拟时显示 */}
-          {!isDeviceConnected && !isSimulating && (
-            <div className="flex items-center bg-slate-800 rounded-lg border border-slate-700 px-3 py-2">
-                <Hash size={14} className="text-slate-500 mr-2" />
-                <input 
-                    type="text" 
-                    value={deviceId}
-                    onChange={(e) => setDeviceId(e.target.value)}
-                    placeholder="ID: 123456"
-                    className="bg-transparent border-none outline-none w-24 text-sm font-mono text-slate-200 placeholder-slate-600 focus:ring-0"
-                    maxLength={6}
-                />
-            </div>
-          )}
-
+          {/* 设备状态指示器 */}
+          <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-slate-800 rounded-lg border border-slate-700">
+            <div className={`w-2 h-2 rounded-full ${isDeviceConnected ? 'bg-green-500 animate-pulse' : 'bg-slate-500'}`} />
+            <span className="text-xs font-mono text-slate-400">
+                {t.device_status}: {isDeviceConnected ? t.connected : t.disconnected}
+            </span>
+          </div>
+          
           {/* 模拟模式按钮 */}
           <button 
             onClick={handleSimulation}
@@ -199,7 +200,7 @@ const App: React.FC = () => {
             }`}
           >
             <Smartphone size={16} />
-            <span className="hidden sm:inline">{t.simulate}</span>
+            {t.simulate}
           </button>
 
           {/* 连接按钮 - 如果正在模拟则禁用或隐藏 */}
@@ -246,8 +247,11 @@ const App: React.FC = () => {
              </div>
              
              {isSimulating && (
-                 <div className="absolute top-4 left-4 px-2 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 font-mono">
-                    SIMULATION MODE
+                 <div className="absolute top-4 left-4 flex flex-col gap-1">
+                     <div className="px-2 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 font-mono inline-block">
+                        SIMULATION MODE
+                     </div>
+                     <span className="text-xs text-slate-500">{t.simulation_hint}</span>
                  </div>
              )}
 
