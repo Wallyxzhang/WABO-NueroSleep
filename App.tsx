@@ -6,7 +6,7 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, HelpCircle } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); // 默认中文
@@ -113,7 +113,7 @@ const App: React.FC = () => {
             }
         } catch (e) {
             console.error("Connection failed", e);
-            alert(`连接错误: ${e instanceof Error ? e.message : String(e)}`);
+            alert(`连接中断或失败: ${e instanceof Error ? e.message : String(e)}\n\n提示：如果不知道是哪个设备，请先关机，点击连接，记下列表。然后再开机，点击连接，选择新出现的那个。`);
         }
     } else {
         await signalProcessor.disconnect();

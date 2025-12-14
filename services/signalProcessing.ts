@@ -1,4 +1,3 @@
-
 import { FrequencyBands, AnalysisMetrics, EEGDataPoint } from '../types';
 import { MEDITATION_THRESHOLD } from '../constants';
 
@@ -87,10 +86,15 @@ declare global {
   }
 }
 
-// Common BLE UART Service UUIDs to try automatically
-const BLE_UART_SERVICES = [
+// Common BLE UART Service UUIDs to try to whitelist in optionalServices
+// Adding more generic ones increases the chance iOS/Bluefy allows access to them
+const COMMON_BLE_SERVICES = [
     '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART
-    '0000ffe0-0000-1000-8000-00805f9b34fb', // HM-10
+    '0000ffe0-0000-1000-8000-00805f9b34fb', // HM-10 / CC2541 / HC-08 / JDY
+    '00001800-0000-1000-8000-00805f9b34fb', // Generic Access
+    '00001801-0000-1000-8000-00805f9b34fb', // Generic Attribute
+    '0000dfb0-0000-1000-8000-00805f9b34fb', // Bluno
+    '0000fe59-0000-1000-8000-00805f9b34fb', // Nordic (Legacy)
 ];
 
 export class DeviceService {
@@ -266,7 +270,8 @@ export class DeviceService {
             return await this.connectBluetooth();
         } catch (e) {
             console.error("蓝牙连接失败:", e);
-            return false;
+            // 抛出错误以便 UI 层捕获并显示详细信息
+            throw e; 
         }
     } else {
         console.error("当前浏览器不支持 Web Serial 也不支持 Web Bluetooth。");
@@ -316,11 +321,10 @@ export class DeviceService {
   // ----------------------
   private async connectBluetooth(): Promise<boolean> {
       // 扫描设备
-      // 注意：acceptAllDevices: true 必须配合 optionalServices 使用才能访问特定服务
-      // 如果不知道设备的具体 Service UUID，这种方式最通用，但可能需要用户手动选择正确的设备
+      // 我们添加了更多常见的 UUID 到 optionalServices，希望能命中您的设备
       this.device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: [...BLE_UART_SERVICES] 
+          optionalServices: [...COMMON_BLE_SERVICES] 
       });
 
       if (!this.device || !this.device.gatt) return false;
@@ -330,39 +334,46 @@ export class DeviceService {
 
       // 连接 GATT Server
       this.server = await this.device.gatt.connect();
-      console.log("蓝牙设备已连接:", this.device.name);
+      console.log("蓝牙设备已连接:", this.device.name, this.device.id);
       
       this.isConnected = true;
 
       // 发现服务和特征值
-      // 我们遍历所有服务，寻找具有 Notify 属性的特征值
+      // 深度扫描：遍历所有 Service，寻找具有 Notify 属性的特征值
+      // 这样即使不知道 SW3011 的具体 UUID，只要它暴露了通知特征值，我们就能连上
       const services = await this.server.getPrimaryServices();
       let foundCharacteristic = false;
+      
+      const foundServiceUUIDs = services.map(s => s.uuid);
+      console.log("发现服务列表:", foundServiceUUIDs);
 
       for (const service of services) {
           try {
             const characteristics = await service.getCharacteristics();
             for (const char of characteristics) {
-                if (char.properties.notify) {
-                    console.log(`找到通知特征值: ${char.uuid}`);
+                console.log(`检查特征值: ${char.uuid}, Props:`, char.properties);
+                // 只要支持 Notify 或 Indicate，我们就尝试监听
+                if (char.properties.notify || char.properties.indicate) {
+                    console.log(`>>> 锁定数据通道: ${char.uuid} (Service: ${service.uuid})`);
+                    
                     await char.startNotifications();
                     char.addEventListener('characteristicvaluechanged', this.handleBluetoothData.bind(this));
+                    
                     foundCharacteristic = true;
-                    // 我们假设只需监听第一个找到的 notify 特征值即可
-                    // 如果 SW3011 有多个，可能需要更精确的 UUID 匹配
+                    // 找到一个可用的通道就足够了
                     break;
                 }
             }
           } catch(e) {
-              console.warn(`无法访问服务 ${service.uuid} 的特征值`, e);
+              console.warn(`无法访问服务 ${service.uuid} 的特征值 (可能是权限限制)`, e);
           }
           if (foundCharacteristic) break;
       }
 
       if (!foundCharacteristic) {
-          console.error("未在设备上找到可用的 Notify 特征值 (SPP/UART)。");
+          // 如果没有找到，抛出具体错误，让用户知道
           this.disconnect();
-          return false;
+          throw new Error(`连接成功，但在设备上未找到数据通道。\n发现的服务: ${foundServiceUUIDs.join(', ')}\n\n请尝试重新连接。`);
       }
 
       return true;
