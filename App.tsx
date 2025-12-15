@@ -6,7 +6,7 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw, Disc, Copy } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); 
@@ -22,6 +22,9 @@ const App: React.FC = () => {
   const [showDebug, setShowDebug] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  
+  // Recording State
+  const [isRecording, setIsRecording] = useState(false);
 
   const intervalRef = useRef<number | null>(null);
   const lastVoiceTime = useRef<number>(0);
@@ -73,6 +76,7 @@ const App: React.FC = () => {
     
     setIsDeviceConnected(isConnected);
     setIsSimulating(isSimMode);
+    setIsRecording(signalProcessor.getIsRecording());
 
     setWaveData(prev => {
       const newData = [...prev, packet.raw];
@@ -131,6 +135,23 @@ const App: React.FC = () => {
 
   const handleRetryHandshake = async () => {
       await signalProcessor.retryHandshake();
+  };
+  
+  const toggleRecording = () => {
+      if (isRecording) {
+          const data = signalProcessor.stopRecording();
+          // Copy to clipboard
+          navigator.clipboard.writeText(data).then(() => {
+              alert("数据已复制到剪贴板！请粘贴发送。");
+          }).catch(err => {
+              alert("无法复制，请查看日志控制台");
+              console.log(data);
+          });
+          setIsRecording(false);
+      } else {
+          signalProcessor.startRecording();
+          setIsRecording(true);
+      }
   };
 
   const handleSimulation = async () => {
@@ -288,8 +309,14 @@ const App: React.FC = () => {
       {/* 开发者调试台 - 浮动在底部 */}
       <div className={`fixed bottom-0 left-0 right-0 bg-black/90 text-green-400 font-mono text-xs transition-transform duration-300 z-[100] border-t border-slate-700 ${showDebug ? 'translate-y-0' : 'translate-y-full'}`}>
         <div className="flex justify-between items-center px-4 py-2 bg-slate-800 border-b border-slate-700">
-            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.4</span>
+            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.5</span>
             <div className="flex gap-2">
+                <button 
+                  onClick={toggleRecording} 
+                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs text-white border ${isRecording ? 'bg-red-600 border-red-500 animate-pulse' : 'bg-slate-700 border-slate-600 hover:bg-slate-600'}`}
+                >
+                   {isRecording ? <><Copy size={12}/> 停止并复制</> : <><Disc size={12}/> 开始录制</>}
+                </button>
                 <button 
                   onClick={handleRetryHandshake} 
                   className="flex items-center gap-1 px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600"

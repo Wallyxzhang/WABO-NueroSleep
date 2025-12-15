@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // Configuration
 // --------------------------------------------------------------------------
 
-const VERSION = "v2.4 (Protocol Fix F1)";
+const VERSION = "v2.5 (Data Recorder)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
@@ -73,7 +73,7 @@ class SignalProcessor {
     private prevOutput: number = 0;
 
     process(sample: number): number {
-        // DC Blocker
+        // DC Blocker (High-pass filter at ~0.5Hz)
         const output = sample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = sample;
         this.prevOutput = output;
@@ -88,9 +88,11 @@ class SignalProcessor {
     getFFT(): FrequencyBands {
         if (this.buffer.length < FFT_SIZE) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
         
+        // Hanning Window
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
         const mags = new Float32Array(FFT_SIZE / 2);
         
+        // DFT Calculation
         for (let k = 0; k < FFT_SIZE / 2; k++) {
              let real = 0; let imag = 0;
              for (let n = 0; n < FFT_SIZE; n++) {
@@ -98,16 +100,22 @@ class SignalProcessor {
                  real += windowed[n] * Math.cos(theta);
                  imag += windowed[n] * Math.sin(theta);
              }
-             mags[k] = Math.sqrt(real * real + imag * imag);
+             // FIXED: Normalize FFT magnitude by dividing by (N/2)
+             // Before: Values proportional to N (~128x too large). Now: True amplitude in uV.
+             mags[k] = (2 * Math.sqrt(real * real + imag * imag)) / FFT_SIZE;
         }
         
-        const res = SAMPLE_RATE / FFT_SIZE;
+        const res = SAMPLE_RATE / FFT_SIZE; // ~0.97 Hz per bin
         const getPower = (minHz: number, maxHz: number) => {
             const minBin = Math.floor(minHz / res);
             const maxBin = Math.ceil(maxHz / res);
             let sum = 0;
-            for(let i=minBin; i<=maxBin && i < mags.length; i++) sum += mags[i];
-            return sum / (Math.max(1, maxBin - minBin));
+            let count = 0;
+            for(let i=minBin; i<=maxBin && i < mags.length; i++) {
+                sum += mags[i];
+                count++;
+            }
+            return count > 0 ? sum / count : 0;
         };
 
         return {
@@ -150,10 +158,11 @@ export class DeviceService {
   private lastAcceleration: { x: number, y: number, z: number } | null = null;
   private simulationInterval: number | null = null;
   
-  // Retry state
-  // Default to 1 (ZeroID) because logs confirm it works (returns F1 data), 
-  // while NameID returned 20/22/24 (status/config).
   private retryMode: number = 1; 
+
+  // Data Recording for Analysis
+  private isRecording: boolean = false;
+  private recordedData: number[] = [];
 
   public setLogger(cb: LogCallback) {
     this.logCallback = cb;
@@ -167,6 +176,23 @@ export class DeviceService {
   public getIsConnected() { return this.isConnected || this.isSimulating; }
   public isSimulationMode() { return this.isSimulating; }
   public getDataSnapshot() { return this.latestData; }
+
+  // --------------------------------------------------------------------------
+  // Recording API
+  // --------------------------------------------------------------------------
+  public startRecording() {
+      this.isRecording = true;
+      this.recordedData = [];
+      this.log(">>> 开始录制原始数据...");
+  }
+
+  public stopRecording(): string {
+      this.isRecording = false;
+      this.log(`>>> 录制结束。共采集 ${this.recordedData.length} 个点。`);
+      return JSON.stringify(this.recordedData);
+  }
+
+  public getIsRecording() { return this.isRecording; }
 
   // --------------------------------------------------------------------------
   // Connect Logic
@@ -209,7 +235,6 @@ export class DeviceService {
       this.log("等待通道稳定 (1秒)...");
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // Initial Handshake - will use retryMode=1 (ZeroID) by default now
       await this.performHandshake();
       
       return true;
@@ -231,7 +256,6 @@ export class DeviceService {
       let idBytes = [0x00, 0x00, 0x00];
       let methodStr = "Default";
 
-      // Strategy 0: Parse from Name (Most likely)
       if (this.retryMode === 0) {
           const match = name.match(/([0-9A-F]{6})$/i);
           if (match) {
@@ -242,12 +266,10 @@ export class DeviceService {
               methodStr = `NameID (${hex})`;
           }
       } 
-      // Strategy 1: All Zeros (Universal/Reset)
       else if (this.retryMode === 1) {
           idBytes = [0x00, 0x00, 0x00];
           methodStr = "ZeroID (000000)";
       }
-      // Strategy 2: Reverse Byte Order (Little Endian)
       else if (this.retryMode === 2) {
           const match = name.match(/([0-9A-F]{6})$/i);
           if (match) {
@@ -259,7 +281,6 @@ export class DeviceService {
           }
       }
 
-      // Construct Command
       const payloadForCrc = [0xB0, 0xB0, 0x03, ...idBytes];
       const crc = calculateCRC8(new Uint8Array(payloadForCrc));
       const packet = new Uint8Array([0xAA, ...payloadForCrc, crc, 0xBB]);
@@ -306,9 +327,6 @@ export class DeviceService {
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
-      // Logging raw bytes is noisy, but good for debug if needed.
-      // Keeping it disabled for performance unless debug needed.
-      
       for (let i = 0; i < value.byteLength; i++) {
           this.rawBuffer.push(value.getUint8(i));
       }
@@ -334,8 +352,6 @@ export class DeviceService {
           if (this.rawBuffer.length < frameSize) return; 
 
           if (this.rawBuffer[frameSize - 1] !== 0xBB) {
-              // Only log if it's not a common fragmentation issue
-              // this.log(`RX Bad Tail: ${this.rawBuffer[frameSize - 1].toString(16)}`);
               this.rawBuffer.shift(); 
               continue; 
           }
@@ -343,12 +359,10 @@ export class DeviceService {
           const func = this.rawBuffer[1];
           const payload = this.rawBuffer.slice(4, 4 + len);
           
-          // CRITICAL FIX: Accept 0xF1 as valid data packet (seen in user logs)
           if (func === 0xF0 || func === 0xF1) {
               this.parseSamples(payload);
           } else if (func === 0xEE) {
-               // Heartbeat or Ack, ignore silently or log
-               // this.log("RX: ACK (EE)");
+               // Heartbeat
           } else {
               this.log(`RX FUNC=${func.toString(16)} LEN=${len}`);
           }
@@ -370,11 +384,16 @@ export class DeviceService {
   }
 
   private processSignal(uv: number) {
+      // Record raw data before filter (or after? Let's record after DC blocker to be useful)
+      // Actually, for analysis, let's record the value coming INTO the DSP loop (the calibrated uV)
+      if (this.isRecording) {
+          this.recordedData.push(uv);
+      }
+
       const filtered = this.dsp.process(uv);
       
       this.latestData.raw = { timestamp: Date.now(), value: filtered };
       
-      // Throttle FFT update slightly to save performance? No, let's keep it smooth.
       const bands = this.dsp.getFFT();
       
       const eps = 0.1;
