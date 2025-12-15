@@ -2,7 +2,7 @@ import { FrequencyBands, AnalysisMetrics, EEGDataPoint } from '../types';
 import { MEDITATION_THRESHOLD } from '../constants';
 
 // --------------------------------------------------------------------------
-// Web Bluetooth 接口定义
+// Web Bluetooth Interface Definitions
 // --------------------------------------------------------------------------
 
 interface BluetoothDevice extends EventTarget {
@@ -34,10 +34,10 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 }
 
 // --------------------------------------------------------------------------
-// 配置与常量
+// Configuration & Constants
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.6 (Zen Smooth Mode)";
+const VERSION = "v3.8 (Channel Fix)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -45,12 +45,13 @@ const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const SCALE_FACTOR = 0.01192; 
 const SAMPLE_RATE = 250; 
 const FFT_SIZE = 256; 
+const FFT_UPDATE_INTERVAL = 25; // Calculate FFT every 25 samples (10Hz)
 
 const PROTOCOL_START = 0xAA;
 const PROTOCOL_END = 0xBB;
 
 // --------------------------------------------------------------------------
-// 辅助函数
+// Helper Functions
 // --------------------------------------------------------------------------
 
 export type LogCallback = (msg: string) => void;
@@ -75,15 +76,21 @@ class SignalProcessor {
     private prevInput: number | null = null;
     private prevOutput: number = 0;
     
-    // 中值滤波缓存
+    // Filters
     private medianBuffer: number[] = [];
-    
-    // Slew Rate Limiter
     private lastValidRaw: number | null = null;
+    private slewViolationCounter: number = 0;
 
-    // --- 平滑处理状态 (Zen Mode) ---
-    private smoothBands: FrequencyBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
-    private signalQuality: number = 1.0; // 1.0 = Good, 0.0 = Bad (Noise)
+    // Artifact Shield (V3.7)
+    // Lockout countdown in samples. If > 0, we consider the signal noisy.
+    private artifactLockout: number = 0;
+    private readonly ARTIFACT_DURATION = 125; // 0.5 seconds lockout on spike
+    private readonly NOISE_THRESHOLD_UV = 200; // Values > 200uV (after filtering) are artifacts
+
+    // Time-Window Buffering (V3.7)
+    // Stores relative power bands for smoothing
+    private bandHistory: FrequencyBands[] = [];
+    private readonly HISTORY_SIZE = 20; // 2 seconds history at 10Hz updates
 
     reset() {
         this.buffer = [];
@@ -91,25 +98,38 @@ class SignalProcessor {
         this.prevOutput = 0;
         this.medianBuffer = [];
         this.lastValidRaw = null;
-        this.smoothBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+        this.slewViolationCounter = 0;
+        this.bandHistory = [];
+        this.artifactLockout = 0;
     }
 
     process(sample: number): { filtered: number, quality: number } {
-        // 0. Slew Rate Limiter (防突变)
-        // 增加容差到 10000，避免误杀大幅度的眼动信号（我们需要保留它但不计入冥想分）
+        // 1. Slew Rate Limiter (Prevent Impossible Jumps)
+        // Adjusted for V3.8: If we consistently violate slew rate, we might be settling DC offset.
+        // Allow jump if it persists.
         let cleanSample = sample;
         if (this.lastValidRaw !== null) {
             const diff = Math.abs(sample - this.lastValidRaw);
-            if (diff > 10000) { 
-                cleanSample = this.lastValidRaw;
+            // 5000uV jump per sample (1/250s) is physically impossible for brain waves
+            // But possible for DC settling.
+            if (diff > 5000) { 
+                this.slewViolationCounter++;
+                if (this.slewViolationCounter < 10) {
+                    cleanSample = this.lastValidRaw; // Clamp
+                } else {
+                    // We've been stuck for 10 samples, assume the jump is real (DC shift)
+                    this.lastValidRaw = sample; 
+                    this.slewViolationCounter = 0;
+                }
             } else {
                 this.lastValidRaw = sample;
+                this.slewViolationCounter = 0;
             }
         } else {
             this.lastValidRaw = sample;
         }
 
-        // 1. 中值滤波
+        // 2. Median Filter (Remove impulsive noise)
         this.medianBuffer.push(cleanSample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
@@ -122,7 +142,8 @@ class SignalProcessor {
             filteredSample = sorted[mid];
         }
 
-        // 2. 去直流 (High-pass)
+        // 3. High-Pass Filter (Remove DC Offset)
+        // 0.995 is roughly a 0.5Hz cutoff at 250Hz sampling
         if (this.prevInput === null) {
             this.prevInput = filteredSample;
             this.prevOutput = 0;
@@ -133,35 +154,42 @@ class SignalProcessor {
         this.prevInput = filteredSample;
         this.prevOutput = output;
         
+        // 4. Update FFT Buffer
         this.buffer.push(output);
         if (this.buffer.length > FFT_SIZE) {
             this.buffer.shift();
         }
 
-        // 3. 信号质量检测 (Signal Quality)
-        // 如果信号幅度过大 (>200uV)，通常是肌电或眼动伪迹
-        // 我们计算最近的平均振幅来判断
-        let quality = 1.0;
-        if (Math.abs(output) > 150) {
-            quality = 0.0; // 强噪音
-        } else if (Math.abs(output) > 80) {
-            quality = 0.5; // 轻微噪音
+        // 5. Artifact Detection (Noise Gate)
+        // If amplitude is too high, it's likely EMG (muscle) or EOG (eye) artifact.
+        if (Math.abs(output) > this.NOISE_THRESHOLD_UV) {
+            this.artifactLockout = this.ARTIFACT_DURATION;
         }
-        
-        // 平滑质量指标
-        this.signalQuality = this.signalQuality * 0.9 + quality * 0.1;
 
-        return { filtered: output, quality: this.signalQuality };
+        if (this.artifactLockout > 0) {
+            this.artifactLockout--;
+        }
+
+        // Quality metric: 1.0 = Clean, 0.0 = Artifact
+        const quality = this.artifactLockout > 0 ? 0.0 : 1.0;
+
+        return { filtered: output, quality };
     }
 
-    getFFT(): FrequencyBands {
-        if (this.buffer.length < FFT_SIZE) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+    // Calculates Relative Power (%) smoothed over time
+    getSmoothedBands(): FrequencyBands | null {
+        if (this.buffer.length < FFT_SIZE) return null;
         
+        // If we are currently in an artifact state, return null to freeze UI
+        if (this.artifactLockout > 0) return null;
+
+        // Perform FFT
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
         const mags = new Float32Array(FFT_SIZE / 2);
         
         for (let k = 0; k < FFT_SIZE / 2; k++) {
              let real = 0; let imag = 0;
+             // Optimized slightly: Calculate sin/cos once if possible, but JS JIT is good.
              for (let n = 0; n < FFT_SIZE; n++) {
                  const theta = -2 * Math.PI * k * n / FFT_SIZE;
                  real += windowed[n] * Math.cos(theta);
@@ -183,7 +211,7 @@ class SignalProcessor {
             return count > 0 ? sum / count : 0;
         };
 
-        const instantBands = {
+        const absoluteBands = {
             delta: getPower(0.5, 4),
             theta: getPower(4, 8),
             alpha: getPower(8, 14),
@@ -191,23 +219,50 @@ class SignalProcessor {
             gamma: getPower(28, 40)
         };
 
-        // 4. 频段数据的深度平滑 (Deep Smoothing)
-        // alpha系数越小，变化越慢。0.05 意味着新数据只占 5% 权重。
-        // 这模拟了呼吸般的缓慢节奏。
-        const smoothFactor = 0.05; 
+        const totalPower = absoluteBands.delta + absoluteBands.theta + absoluteBands.alpha + absoluteBands.beta + absoluteBands.gamma + 0.0001;
         
-        this.smoothBands.delta = this.smoothBands.delta * (1-smoothFactor) + instantBands.delta * smoothFactor;
-        this.smoothBands.theta = this.smoothBands.theta * (1-smoothFactor) + instantBands.theta * smoothFactor;
-        this.smoothBands.alpha = this.smoothBands.alpha * (1-smoothFactor) + instantBands.alpha * smoothFactor;
-        this.smoothBands.beta  = this.smoothBands.beta  * (1-smoothFactor) + instantBands.beta  * smoothFactor;
-        this.smoothBands.gamma = this.smoothBands.gamma * (1-smoothFactor) + instantBands.gamma * smoothFactor;
+        const relativeBands: FrequencyBands = {
+            delta: (absoluteBands.delta / totalPower) * 100,
+            theta: (absoluteBands.theta / totalPower) * 100,
+            alpha: (absoluteBands.alpha / totalPower) * 100,
+            beta:  (absoluteBands.beta  / totalPower) * 100,
+            gamma: (absoluteBands.gamma / totalPower) * 100
+        };
 
-        return { ...this.smoothBands };
+        // Push to history buffer for smoothing
+        this.bandHistory.push(relativeBands);
+        if (this.bandHistory.length > this.HISTORY_SIZE) {
+            this.bandHistory.shift();
+        }
+
+        // Return the average of the history buffer
+        return this.averageBands(this.bandHistory);
+    }
+
+    private averageBands(history: FrequencyBands[]): FrequencyBands {
+        if (history.length === 0) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+        
+        const sum = history.reduce((acc, curr) => ({
+            delta: acc.delta + curr.delta,
+            theta: acc.theta + curr.theta,
+            alpha: acc.alpha + curr.alpha,
+            beta:  acc.beta + curr.beta,
+            gamma: acc.gamma + curr.gamma,
+        }), { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 });
+
+        const len = history.length;
+        return {
+            delta: sum.delta / len,
+            theta: sum.theta / len,
+            alpha: sum.alpha / len,
+            beta:  sum.beta / len,
+            gamma: sum.gamma / len,
+        };
     }
 }
 
 // --------------------------------------------------------------------------
-// 蓝牙设备服务类
+// Bluetooth Device Service
 // --------------------------------------------------------------------------
 
 export class DeviceService {
@@ -220,6 +275,7 @@ export class DeviceService {
   
   private rawBuffer: number[] = [];
   private dsp: SignalProcessor = new SignalProcessor();
+  private sampleCounter: number = 0;
 
   private debugRawEnabled: boolean = false;
   private ignoreCRC: boolean = false;
@@ -231,7 +287,7 @@ export class DeviceService {
   } = {
     raw: { timestamp: 0, value: 0 },
     bands: { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 },
-    metrics: { attention: 0, relaxation: 0, isMeditating: false }
+    metrics: { attention: 0, relaxation: 0, isMeditating: false, signalQuality: 1.0 }
   };
 
   private isSimulating: boolean = false;
@@ -462,27 +518,36 @@ export class DeviceService {
   }
 
   private parseADCData(payload: number[]) {
-      let offset = 0;
+      // FIX V3.8: Correctly handle interleaved channel data
+      // Payload structure: [Counter(1)] [Ch1(3)] [Ch2(3)] [Ch1(3)] [Ch2(3)] ...
       
-      while (offset < payload.length) {
-          let val = 0;
+      // Start at index 1 to skip Packet Counter (usually index 0)
+      let offset = 1;
+      
+      let channelIndex = 0; // 0 = Ch1, 1 = Ch2
+
+      while (offset + 3 <= payload.length) {
+          // Read 3 bytes (24-bit) - Little Endian (Standard for these modules)
+          // Format: [LSB] [Mid] [MSB]
+          // If previous code was shifting +5, +4, +3, that was Big Endian or Mixed.
+          // Let's assume Little Endian based on typical TGAM/Sili behavior:
+          const val = (payload[offset+2] << 16) | (payload[offset+1] << 8) | payload[offset];
           
-          if (offset === 0) {
-              if (offset + 6 > payload.length) break;
-              val = (payload[offset+5] << 16) | (payload[offset+4] << 8) | payload[offset+3];
-              offset += 6;
-          } else {
-              if (offset + 4 > payload.length) break;
-              val = (payload[offset+3] << 16) | (payload[offset+2] << 8) | payload[offset+1];
-              offset += 4;
+          let signedVal = val;
+          if (signedVal & 0x800000) {
+              signedVal = signedVal | 0xFF000000;
           }
 
-          if (val & 0x800000) {
-              val = val | 0xFF000000;
+          const uv = signedVal * SCALE_FACTOR;
+
+          // Only process Channel 1 (indices 0, 2, 4...)
+          // Interleaved data: Ch1, Ch2, Ch1, Ch2...
+          if (channelIndex === 0) {
+              this.processSignal(uv);
           }
 
-          const uv = val * SCALE_FACTOR;
-          this.processSignal(uv);
+          offset += 3;
+          channelIndex = (channelIndex + 1) % 2; // Toggle channel
       }
   }
   
@@ -499,42 +564,44 @@ export class DeviceService {
           this.recordedData.push(uv);
       }
 
-      // 1. 信号处理
+      // 1. Filter the signal (every sample)
       const { filtered, quality } = this.dsp.process(uv);
+      this.sampleCounter++;
       
+      // Update Raw View (always active)
       if (filtered !== 0) {
           this.latestData.raw = { timestamp: Date.now(), value: filtered };
+          this.latestData.metrics.signalQuality = quality;
           
-          const bands = this.dsp.getFFT();
-          
-          // 2. 指数计算
-          const eps = 0.1;
-          const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
-          
-          const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
-          const attMetric = (bands.beta + bands.gamma) / totalPower;
+          // 2. Compute FFT and Metrics (Throttled to 10Hz)
+          if (this.sampleCounter % FFT_UPDATE_INTERVAL === 0) {
+              
+              const smoothedBands = this.dsp.getSmoothedBands();
+              
+              if (smoothedBands) {
+                  const bands = smoothedBands;
+                  
+                  // Relaxation formula
+                  const relaxScore = (bands.alpha * 2.0 + bands.theta) / 100;
+                  const clampedRelax = Math.min(1.0, Math.max(0, relaxScore));
+                  
+                  const attnScore = (bands.beta + bands.gamma) / 80;
+                  const clampedAttn = Math.min(1.0, Math.max(0, attnScore));
 
-          // 3. 极度平滑的用户反馈指标 (Zen Smoothing)
-          // 如果信号质量差（干扰大），我们“冻结”指标变化，或者让它极其缓慢地变化，避免干扰数据造成用户困惑。
-          // 正常权重 0.02 (非常慢), 噪音时权重 0.005 (几乎不动)
-          const metricWeight = quality > 0.8 ? 0.02 : 0.005;
-          
-          const prevRel = this.latestData.metrics.relaxation;
-          const smoothRel = prevRel * (1 - metricWeight) + Math.min(1.0, relMetric) * metricWeight;
-          
-          const smoothAtt = this.latestData.metrics.attention * (1 - metricWeight) + attMetric * metricWeight;
-
-          this.latestData.bands = bands;
-          this.latestData.metrics = {
-              relaxation: smoothRel,
-              attention: smoothAtt,
-              isMeditating: smoothRel > MEDITATION_THRESHOLD
-          };
+                  this.latestData.bands = bands;
+                  this.latestData.metrics = {
+                      relaxation: clampedRelax,
+                      attention: clampedAttn,
+                      isMeditating: clampedRelax > 0.65,
+                      signalQuality: quality
+                  };
+              }
+          }
       }
   }
 
   // --------------------------------------------------------------------------
-  // 模拟模式
+  // Simulation Mode
   // --------------------------------------------------------------------------
   public async requestMotionPermission(): Promise<boolean> {
       if (typeof (DeviceMotionEvent as any) !== 'undefined' && typeof (DeviceMotionEvent as any).requestPermission === 'function') {
@@ -572,14 +639,18 @@ export class DeviceService {
   private updateSimulation() {
     this.agitationLevel = Math.max(0, this.agitationLevel * 0.9);
     const rel = Math.max(0, 1 - (this.agitationLevel / 50));
-    // 模拟数据也要平滑
-    const prevRel = this.latestData.metrics.relaxation;
-    const smoothRel = prevRel * 0.95 + rel * 0.05;
+    
+    // Simulate relative bands
+    const alphaSim = rel * 40 + 10;
+    const betaSim = (1-rel) * 30 + 10;
+    const thetaSim = 15;
+    const deltaSim = 10;
+    const gammaSim = 5;
     
     this.latestData = {
         raw: { timestamp: Date.now(), value: Math.sin(Date.now()/50)*10 + (Math.random()-0.5)*5 },
-        bands: { delta: 5, theta: 5, alpha: smoothRel*40, beta: (1-smoothRel)*20, gamma: 5 },
-        metrics: { relaxation: smoothRel, attention: 1-smoothRel, isMeditating: smoothRel > 0.8 }
+        bands: { delta: deltaSim, theta: thetaSim, alpha: alphaSim, beta: betaSim, gamma: gammaSim },
+        metrics: { relaxation: rel, attention: 1-rel, isMeditating: rel > 0.7, signalQuality: 1.0 }
     };
   }
 }

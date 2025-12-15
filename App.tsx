@@ -3,6 +3,7 @@ import { WaboLogo } from './components/Logo';
 import { WaveChart } from './components/WaveChart';
 import { AlphaVisualizer } from './components/AlphaVisualizer';
 import { MetricCard } from './components/MetricCard';
+import { SignalQualityIndicator } from './components/SignalQualityIndicator';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
@@ -16,7 +17,7 @@ const App: React.FC = () => {
   
   const [waveData, setWaveData] = useState<EEGDataPoint[]>([]);
   const [bands, setBands] = useState<FrequencyBands>({ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 });
-  const [metrics, setMetrics] = useState<AnalysisMetrics>({ attention: 0, relaxation: 0, isMeditating: false });
+  const [metrics, setMetrics] = useState<AnalysisMetrics>({ attention: 0, relaxation: 0, isMeditating: false, signalQuality: 1.0 });
 
   // 调试日志状态
   const [showDebug, setShowDebug] = useState(false);
@@ -285,14 +286,24 @@ const App: React.FC = () => {
       <main className="flex-1 container mx-auto px-4 py-6 max-w-6xl grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-7 flex flex-col gap-6">
           <div className="flex-1 bg-gradient-to-b from-slate-800/30 to-slate-900/30 border border-slate-700/50 rounded-2xl relative overflow-hidden flex flex-col items-center justify-center min-h-[400px]">
+             
+             {/* Background Grid */}
              <div className="absolute inset-0 opacity-10" 
                   style={{ backgroundImage: 'linear-gradient(#334155 1px, transparent 1px), linear-gradient(90deg, #334155 1px, transparent 1px)', backgroundSize: '40px 40px' }}>
              </div>
-             {isSimulating && (
-                 <div className="absolute top-4 left-4 flex flex-col gap-1">
-                     <div className="px-2 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 font-mono inline-block">SIMULATION</div>
-                 </div>
-             )}
+
+             {/* Signal Quality Indicator - Floating Top Left */}
+             <div className="absolute top-4 left-4 z-20 flex flex-col gap-2">
+                 <SignalQualityIndicator 
+                    quality={metrics.signalQuality} 
+                    isConnected={isDeviceConnected} 
+                    language={language}
+                 />
+                 {isSimulating && (
+                     <div className="px-2 py-1 bg-amber-500/20 text-amber-400 text-xs rounded border border-amber-500/40 font-mono inline-block text-center">SIMULATION</div>
+                 )}
+             </div>
+
              <AlphaVisualizer 
                 alphaPower={bands.alpha}
                 relaxationScore={metrics.relaxation}

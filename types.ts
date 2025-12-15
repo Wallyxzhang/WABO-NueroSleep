@@ -15,6 +15,7 @@ export interface AnalysisMetrics {
   attention: number;
   relaxation: number;
   isMeditating: boolean;
+  signalQuality: number; // 0.0 (Noise) to 1.0 (Clean)
 }
 
 export enum AppState {
