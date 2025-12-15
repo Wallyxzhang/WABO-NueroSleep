@@ -37,12 +37,12 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.3 (Fixed Offset)";
+const VERSION = "v3.4 (Protocol Aligned)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
 
-const SCALE_FACTOR = 0.01192; 
+const SCALE_FACTOR = 0.01192; // 转换系数
 const SAMPLE_RATE = 250; 
 const FFT_SIZE = 256; 
 
@@ -80,7 +80,6 @@ class SignalProcessor {
 
     process(sample: number): number {
         // 1. 中值滤波 (Median Filter) 
-        // 窗口大小 5，能有效去除偶尔混入的单点 0 或极大值
         this.medianBuffer.push(sample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
@@ -93,7 +92,8 @@ class SignalProcessor {
             filteredSample = sorted[mid];
         }
 
-        // 2. 去直流漂移 (High-pass)
+        // 2. 去直流漂移 (High-pass Filter)
+        // 0.995 是极点，决定了截止频率。对于EEG信号，去除直流偏置非常重要。
         const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = filteredSample;
         this.prevOutput = output;
@@ -321,9 +321,7 @@ export class DeviceService {
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
-      
-      // CRITICAL FIX: Explicitly use byteOffset and byteLength. 
-      // 'value.buffer' points to the whole underlying memory store, which may be huge and contain garbage/zeros outside the relevant slice.
+      // 必须使用 byteOffset，否则在 Android/Chrome 上可能读取到错误的内存区域
       const newBytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
       
       if (this.debugRawEnabled) {
@@ -344,20 +342,21 @@ export class DeviceService {
       }
 
       while (this.rawBuffer.length >= 7) {
+          // 查找帧头
           if (this.rawBuffer[0] !== PROTOCOL_START) {
               this.rawBuffer.shift();
               continue;
           }
 
           const payloadLen = this.rawBuffer[3];
-          const frameSize = 6 + payloadLen;
+          const frameSize = 6 + payloadLen; // Header(4) + Payload(Len) + CRC(1) + End(1)
 
           if (this.rawBuffer.length < frameSize) {
-              return; 
+              return; // 数据未收全
           }
 
           if (this.rawBuffer[frameSize - 1] !== PROTOCOL_END) {
-              this.rawBuffer.shift();
+              this.rawBuffer.shift(); // 帧尾不匹配，滑动窗口
               continue;
           }
 
@@ -398,30 +397,45 @@ export class DeviceService {
   }
 
   private parseADCData(payload: number[]) {
-      // 策略：跳过前 3 个字节（通常是状态/Header）。
-      // 然后假设数据结构为 [Header(3), Data(3), Header(1), Data(3)...]
-      // 这个步长逻辑 (offset + 4) 适配单样本包 (len=6) 和多样本包 (len=10) 的常见格式。
-      // 最重要的是：它避免了读取 Header 作为数据（Header通常为0，会导致信号变平）。
+      // 根据 SW3011 协议文档 4.3 节：
+      // 缓冲深度 > 1 (0x60 自动配置通常会开启8倍或32倍缓冲)
+      // 第 1 个样本：STATUS(3字节) + DATA(3字节) = 6 字节
+      // 第 2-N 个样本：STATUS(1字节) + DATA(3字节) = 4 字节
       
-      let offset = 3; // Start after global header
+      let offset = 0;
       
-      while (offset + 2 < payload.length) {
-          const val32 = (payload[offset] << 16) | (payload[offset+1] << 8) | payload[offset+2];
+      while (offset < payload.length) {
+          let val = 0;
           
-          let val = val32;
+          if (offset === 0) {
+              // --- 第一个样本 (6字节) ---
+              // 格式: [S0, S1, S2, D0, D1, D2]
+              // 文档指定为小端序: int32_t adc1 = (data[5] << 16) | (data[4] << 8) | data[3];
+              if (offset + 6 > payload.length) break;
+              
+              // 取后3个字节作为数据，组合成24位整数
+              // D0=payload[3], D1=payload[4], D2=payload[5]
+              val = (payload[offset+5] << 16) | (payload[offset+4] << 8) | payload[offset+3];
+              
+              offset += 6;
+          } else {
+              // --- 后续样本 (4字节) ---
+              // 格式: [S0, D0, D1, D2]
+              // 文档: int32_t adc_n = (data[offset+3] << 16) | (data[offset+2] << 8) | data[offset+1];
+              if (offset + 4 > payload.length) break;
+              
+              val = (payload[offset+3] << 16) | (payload[offset+2] << 8) | payload[offset+1];
+              
+              offset += 4;
+          }
+
           // 24-bit 补码符号扩展
           if (val & 0x800000) {
               val = val | 0xFF000000;
           }
 
           const uv = val * SCALE_FACTOR;
-          
-          // 仅在值不为纯0时传递？不，保留0供滤波器处理，但通常Header跳过后这里不会是0
           this.processSignal(uv);
-
-          // 假设每个数据点后面跟一个字节的状态/分隔符
-          // 如果这里不对，Median Filter 也会帮忙修整
-          offset += 4; 
       }
   }
   
