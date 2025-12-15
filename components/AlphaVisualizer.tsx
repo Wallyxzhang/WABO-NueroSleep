@@ -1,75 +1,188 @@
-import React from 'react';
+import React, { useRef, useEffect } from 'react';
 
 interface AlphaVisualizerProps {
   alphaPower: number;
   relaxationScore: number;
   isMeditating: boolean;
-  textMap: any; // 接收语言包
+  textMap: any;
+}
+
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  radius: number;
+  alpha: number;
+  targetX?: number;
+  targetY?: number;
+  phase: number;
 }
 
 export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, relaxationScore, isMeditating, textMap }) => {
-  // 归一化大小用于可视化
-  const coreSize = 100 + (relaxationScore * 50); // 放松时变大
-  const glowOpacity = Math.min(1, relaxationScore * 0.8);
-  const pulseSpeed = isMeditating ? '3s' : '1s';
-  const color = isMeditating ? 'rgb(56, 189, 248)' : 'rgb(148, 163, 184)'; // 天蓝 vs 石板灰
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const particlesRef = useRef<Particle[]>([]);
+  const frameIdRef = useRef<number>(0);
+
+  // Initialize particles
+  useEffect(() => {
+    if (!particlesRef.current.length) {
+      for (let i = 0; i < 150; i++) {
+        particlesRef.current.push({
+          x: Math.random() * 300,
+          y: Math.random() * 300,
+          vx: (Math.random() - 0.5) * 0.5,
+          vy: (Math.random() - 0.5) * 0.5,
+          radius: Math.random() * 1.5 + 0.5,
+          alpha: Math.random() * 0.5 + 0.2,
+          phase: Math.random() * Math.PI * 2
+        });
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    const centerX = width / 2;
+    const centerY = height / 2;
+
+    const render = () => {
+      // Clear canvas with a very slight trail effect
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.2)'; 
+      ctx.fillRect(0, 0, width, height);
+
+      // Determine state
+      // Relaxation 0.0 -> Scattered randomly
+      // Relaxation 1.0 -> Condensed in center
+      
+      const isRelaxed = relaxationScore > 0.6;
+      const coreRadius = 40 + alphaPower * 0.5; // Base size fluctuates with Alpha
+      
+      particlesRef.current.forEach((p, i) => {
+        p.phase += 0.05;
+        
+        if (isRelaxed) {
+            // --- CONDENSED MODE (Light Ball) ---
+            // Particles orbit the center or stick to surface
+            const angle = (i / particlesRef.current.length) * Math.PI * 2 + p.phase * 0.1;
+            // Target distance from center based on relaxation score (tighter when more relaxed)
+            const tightness = 1 - Math.min(1, relaxationScore); 
+            const targetDist = coreRadius * (0.8 + Math.sin(p.phase)*0.2) + (tightness * 100);
+            
+            const targetX = centerX + Math.cos(angle) * targetDist;
+            const targetY = centerY + Math.sin(angle) * targetDist;
+            
+            // Move towards target
+            p.x += (targetX - p.x) * 0.05;
+            p.y += (targetY - p.y) * 0.05;
+            
+            // Add some jitter/energy
+            p.x += (Math.random() - 0.5) * 2;
+            p.y += (Math.random() - 0.5) * 2;
+
+        } else {
+            // --- SCATTERED MODE (Starlight) ---
+            // Particles drift freely
+            p.x += p.vx + (Math.random()-0.5)*0.5;
+            p.y += p.vy + (Math.random()-0.5)*0.5;
+            
+            // Soft boundaries - wrap around
+            if (p.x < 0) p.x = width;
+            if (p.x > width) p.x = 0;
+            if (p.y < 0) p.y = height;
+            if (p.y > height) p.y = 0;
+            
+            // Push away from center slightly if very agitated
+            const dx = p.x - centerX;
+            const dy = p.y - centerY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            if (dist < 50) {
+                p.vx += dx * 0.001;
+                p.vy += dy * 0.001;
+            }
+        }
+
+        // Draw Particle
+        ctx.beginPath();
+        const flicker = 0.5 + 0.5 * Math.sin(p.phase);
+        ctx.globalAlpha = p.alpha * flicker;
+        
+        // Color transition: White/Blue -> Gold/Green based on state
+        if (isMeditating) {
+            ctx.fillStyle = `hsl(160, 100%, ${50 + flicker * 50}%)`; // Greenish Cyan
+        } else if (isRelaxed) {
+            ctx.fillStyle = `hsl(200, 100%, ${60 + flicker * 40}%)`; // Sky Blue
+        } else {
+            ctx.fillStyle = `hsl(220, 20%, ${80 + flicker * 20}%)`; // Pale Blue/White
+        }
+
+        ctx.arc(p.x, p.y, p.radius * (isRelaxed ? 1.5 : 1), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1.0;
+      });
+
+      // Draw Core Glow when relaxed
+      if (relaxationScore > 0.3) {
+          const glowSize = coreRadius * relaxationScore * 1.5;
+          const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, glowSize);
+          
+          if (isMeditating) {
+            gradient.addColorStop(0, 'rgba(52, 211, 153, 0.4)'); // Emerald
+            gradient.addColorStop(1, 'rgba(52, 211, 153, 0)');
+          } else {
+            gradient.addColorStop(0, 'rgba(56, 189, 248, 0.3)'); // Sky
+            gradient.addColorStop(1, 'rgba(56, 189, 248, 0)');
+          }
+          
+          ctx.globalCompositeOperation = 'screen';
+          ctx.fillStyle = gradient;
+          ctx.beginPath();
+          ctx.arc(centerX, centerY, glowSize, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalCompositeOperation = 'source-over';
+      }
+
+      frameIdRef.current = requestAnimationFrame(render);
+    };
+
+    render();
+
+    return () => {
+      cancelAnimationFrame(frameIdRef.current);
+    };
+  }, [relaxationScore, isMeditating, alphaPower]);
 
   return (
-    <div className="relative flex flex-col items-center justify-center py-10">
-      {/* 状态文本 */}
-      <div className="absolute top-0 text-center z-10">
-        <h2 className="text-3xl font-light text-white tracking-tight">
+    <div className="relative flex flex-col items-center justify-center h-full w-full min-h-[400px]">
+      <div className="absolute top-6 text-center z-10 pointer-events-none">
+        <h2 className={`text-3xl font-light tracking-tight transition-colors duration-500 ${isMeditating ? 'text-emerald-400' : 'text-slate-100'}`}>
           {isMeditating ? textMap.meditation_state : textMap.active_mind}
         </h2>
         <p className="text-slate-400 text-sm mt-1 font-mono">
-          {textMap.alpha_index}: {alphaPower.toFixed(1)} uV²
+          {textMap.alpha_index}: {alphaPower.toFixed(1)}
         </p>
       </div>
 
-      {/* 可视化圆环 */}
-      <div className="relative w-80 h-80 flex items-center justify-center mt-8">
-        {/* 外环 - 呼吸效果 */}
-        <div 
-          className="absolute rounded-full border border-sky-500/30"
-          style={{
-            width: `${coreSize * 2.5}px`,
-            height: `${coreSize * 2.5}px`,
-            transition: 'all 1s ease-out',
-            animation: `ping ${pulseSpeed} cubic-bezier(0, 0, 0.2, 1) infinite`
-          }}
-        />
-        
-        {/* 光晕层 */}
-        <div 
-          className="absolute rounded-full blur-3xl bg-sky-500"
-          style={{
-            width: `${coreSize * 2}px`,
-            height: `${coreSize * 2}px`,
-            opacity: glowOpacity * 0.4,
-            transition: 'all 0.5s ease-out'
-          }}
-        />
-
-        {/* 核心圆 */}
-        <div 
-          className="rounded-full shadow-2xl backdrop-blur-md flex items-center justify-center transition-all duration-700"
-          style={{
-            width: `${coreSize}px`,
-            height: `${coreSize}px`,
-            background: `radial-gradient(circle at 30% 30%, ${color}, rgba(15, 23, 42, 0.8))`,
-            boxShadow: `0 0 ${relaxationScore * 40}px ${color}`
-          }}
-        >
-          <span className="text-2xl font-bold text-white drop-shadow-md">
-            {(relaxationScore * 100).toFixed(0)}%
-          </span>
-        </div>
-      </div>
+      <canvas 
+        ref={canvasRef}
+        width={400}
+        height={400}
+        className="w-full h-full max-w-[400px] max-h-[400px]"
+      />
       
-      <div className="mt-8 text-center">
-         <div className="inline-flex items-center px-4 py-2 rounded-full bg-slate-800 border border-slate-700">
-            <div className={`w-3 h-3 rounded-full mr-2 ${isMeditating ? 'bg-green-400 shadow-[0_0_10px_rgba(74,222,128,0.8)]' : 'bg-amber-400'}`}></div>
-            <span className="text-sm font-medium text-slate-200">
+      <div className="absolute bottom-6 text-center pointer-events-none">
+         <div className={`inline-flex items-center px-4 py-2 rounded-full border backdrop-blur-md transition-all duration-700 ${
+             isMeditating 
+             ? 'bg-emerald-900/30 border-emerald-500/50 shadow-[0_0_20px_rgba(16,185,129,0.3)]' 
+             : 'bg-slate-800/50 border-slate-700'
+         }`}>
+            <span className={`text-sm font-medium ${isMeditating ? 'text-emerald-300' : 'text-slate-300'}`}>
               {isMeditating ? textMap.target_achieved : textMap.focus_breath}
             </span>
          </div>
