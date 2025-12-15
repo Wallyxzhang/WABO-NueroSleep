@@ -37,13 +37,12 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v2.7 (CRC Check & AutoStart)";
+const VERSION = "v2.8 (Protocol Analyzer)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // 写入特征 (Write)
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 通知特征 (Notify)
 
 // ADS1299 转换系数 (Gain=24, Vref=4.5V/2?) 
-// 根据硬件不同可能需要微调，目前保持原设定
 const SCALE_FACTOR = (2.454 / (12 * 8388608)) * 1000000;
 const SAMPLE_RATE = 250; 
 const FFT_SIZE = 256; 
@@ -54,10 +53,6 @@ const FFT_SIZE = 256;
 
 export type LogCallback = (msg: string) => void;
 
-/**
- * 计算 CRC8 校验码
- * 用于验证数据包的完整性
- */
 function calculateCRC8(data: Uint8Array | number[]): number {
   let crc = 0x00;
   for (let i = 0; i < data.length; i++) {
@@ -73,17 +68,13 @@ function calculateCRC8(data: Uint8Array | number[]): number {
   return crc;
 }
 
-/**
- * 信号处理器
- * 负责滤波和 FFT 变换
- */
 class SignalProcessor {
     private buffer: number[] = [];
     private prevInput: number = 0;
     private prevOutput: number = 0;
 
-    // 预处理：去直流漂移 (High-pass filter)
     process(sample: number): number {
+        // 去直流漂移 (High-pass filter)
         const output = sample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = sample;
         this.prevOutput = output;
@@ -95,15 +86,13 @@ class SignalProcessor {
         return output;
     }
 
-    // 计算 FFT 频谱能量
     getFFT(): FrequencyBands {
         if (this.buffer.length < FFT_SIZE) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
         
-        // 汉宁窗 (Hanning Window) - 减少频谱泄漏
+        // 汉宁窗
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
         const mags = new Float32Array(FFT_SIZE / 2);
         
-        // 离散傅里叶变换 (DFT)
         for (let k = 0; k < FFT_SIZE / 2; k++) {
              let real = 0; let imag = 0;
              for (let n = 0; n < FFT_SIZE; n++) {
@@ -111,13 +100,10 @@ class SignalProcessor {
                  real += windowed[n] * Math.cos(theta);
                  imag += windowed[n] * Math.sin(theta);
              }
-             // 归一化幅度: 乘以2除以N，得到真实的微伏(uV)值
              mags[k] = (2 * Math.sqrt(real * real + imag * imag)) / FFT_SIZE;
         }
         
-        const res = SAMPLE_RATE / FFT_SIZE; // 频率分辨率 ~0.97 Hz
-        
-        // 计算特定频段的平均功率
+        const res = SAMPLE_RATE / FFT_SIZE;
         const getPower = (minHz: number, maxHz: number) => {
             const minBin = Math.floor(minHz / res);
             const maxBin = Math.ceil(maxHz / res);
@@ -155,6 +141,10 @@ export class DeviceService {
   private rawBuffer: number[] = [];
   private dsp: SignalProcessor = new SignalProcessor();
 
+  // 调试开关
+  private debugRawEnabled: boolean = false;
+  private ignoreCRC: boolean = false;
+
   private latestData: { 
     raw: EEGDataPoint, 
     bands: FrequencyBands, 
@@ -171,8 +161,6 @@ export class DeviceService {
   private simulationInterval: number | null = null;
   
   private retryMode: number = 1; 
-
-  // 数据录制功能
   private isRecording: boolean = false;
   private recordedData: number[] = [];
 
@@ -185,22 +173,33 @@ export class DeviceService {
     if (this.logCallback) this.logCallback(msg);
   }
 
+  // --------------------------------------------------------------------------
+  // 公共控制 API
+  // --------------------------------------------------------------------------
+
   public getIsConnected() { return this.isConnected || this.isSimulating; }
   public isSimulationMode() { return this.isSimulating; }
   public getDataSnapshot() { return this.latestData; }
 
-  // --------------------------------------------------------------------------
-  // 录制 API
-  // --------------------------------------------------------------------------
+  public setDebugRaw(enabled: boolean) {
+      this.debugRawEnabled = enabled;
+      this.log(`>>> 原始数据嗅探模式: ${enabled ? '开启' : '关闭'}`);
+  }
+
+  public setIgnoreCRC(enabled: boolean) {
+      this.ignoreCRC = enabled;
+      this.log(`>>> 强制解析模式 (忽略CRC): ${enabled ? '开启' : '关闭'}`);
+  }
+
   public startRecording() {
       this.isRecording = true;
       this.recordedData = [];
-      this.log(">>> 开始录制原始数据...");
+      this.log(">>> 开始录制...");
   }
 
   public stopRecording(): string {
       this.isRecording = false;
-      this.log(`>>> 录制结束。共采集 ${this.recordedData.length} 个点。`);
+      this.log(`>>> 录制结束。共 ${this.recordedData.length} 点。`);
       const json = JSON.stringify(this.recordedData);
       console.log("Recorded Data:", json);
       return json;
@@ -209,7 +208,7 @@ export class DeviceService {
   public getIsRecording() { return this.isRecording; }
 
   // --------------------------------------------------------------------------
-  // 连接逻辑
+  // 连接与指令
   // --------------------------------------------------------------------------
 
   public async connect(): Promise<boolean> {
@@ -246,16 +245,8 @@ export class DeviceService {
       await txChar.startNotifications();
       txChar.addEventListener('characteristicvaluechanged', this.handleBluetoothData.bind(this));
 
-      this.log("等待通道稳定 (1秒)...");
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // 1. 发送握手
+      // 握手
       await this.performHandshake();
-
-      // 2. 自动发送开始指令 (许多芯片需要此指令开始推流)
-      this.log(">>> 自动发送启动指令 (0x02)...");
-      await new Promise(resolve => setTimeout(resolve, 500));
-      await this.sendRawByte(0x02);
       
       return true;
 
@@ -268,68 +259,24 @@ export class DeviceService {
 
   public async performHandshake() {
       if (!this.device || !this.rxChar) {
-          this.log("无法握手: 未连接");
+          this.log("未连接");
           return;
       }
-
-      const name = this.device.name || "SILI_000000";
-      let idBytes = [0x00, 0x00, 0x00];
-      let methodStr = "Default";
-
-      // 策略选择
-      if (this.retryMode === 0) {
-          const match = name.match(/([0-9A-F]{6})$/i);
-          if (match) {
-              const hex = match[1];
-              idBytes[0] = parseInt(hex.substring(0, 2), 16);
-              idBytes[1] = parseInt(hex.substring(2, 4), 16);
-              idBytes[2] = parseInt(hex.substring(4, 6), 16);
-              methodStr = `NameID (${hex})`;
-          }
-      } 
-      else if (this.retryMode === 1) {
-          idBytes = [0x00, 0x00, 0x00];
-          methodStr = "ZeroID (000000)";
-      }
-      else if (this.retryMode === 2) {
-          const match = name.match(/([0-9A-F]{6})$/i);
-          if (match) {
-              const hex = match[1];
-              idBytes[2] = parseInt(hex.substring(0, 2), 16);
-              idBytes[1] = parseInt(hex.substring(2, 4), 16);
-              idBytes[0] = parseInt(hex.substring(4, 6), 16);
-              methodStr = `RevID`;
-          }
-      }
-
-      // 构建数据包: 0xAA [Func=B0] [Len=3] [ID...] [CRC] 0xBB
-      const payloadForCrc = [0xB0, 0xB0, 0x03, ...idBytes];
-      const crc = calculateCRC8(new Uint8Array(payloadForCrc));
-      const packet = new Uint8Array([0xAA, ...payloadForCrc, crc, 0xBB]);
-
-      const hexStr = Array.from(packet).map(b => b.toString(16).padStart(2,'0').toUpperCase()).join(' ');
-      this.log(`TX [${methodStr}] >>> ${hexStr}`);
-      
-      try {
-          await this.rxChar.writeValue(packet);
-      } catch (e) {
-          this.log(`写入失败: ${e}`);
-      }
+      // 默认尝试握手
+      await this.sendRawByte(0x02); // 尝试发送简单的启动指令
   }
 
   public async retryHandshake() {
-      this.retryMode = (this.retryMode + 1) % 3;
-      this.log(`>>> 切换握手策略 #${this.retryMode} 并重试`);
+      this.log("重发握手指令...");
       await this.performHandshake();
   }
 
-  // 发送自定义 Hex 命令
   public async sendHexCommand(hex: string) {
       if (!this.rxChar) return;
       
       const cleanHex = hex.replace(/[^0-9A-Fa-f]/g, '');
       if (cleanHex.length % 2 !== 0) {
-          this.log("错误: Hex 长度必须是偶数");
+          this.log("错误: Hex 长度须为偶数");
           return;
       }
       
@@ -338,7 +285,19 @@ export class DeviceService {
           bytes[i / 2] = parseInt(cleanHex.substring(i, i + 2), 16);
       }
       
-      this.log(`TX [手动] >>> ${Array.from(bytes).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`);
+      this.log(`TX [HEX] >>> ${Array.from(bytes).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`);
+      try {
+          await this.rxChar.writeValue(bytes);
+      } catch(e) {
+          this.log(`写入错误: ${e}`);
+      }
+  }
+
+  public async sendASCIICommand(text: string) {
+      if (!this.rxChar) return;
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(text);
+      this.log(`TX [ASCII] >>> "${text}"`);
       try {
           await this.rxChar.writeValue(bytes);
       } catch(e) {
@@ -350,7 +309,7 @@ export class DeviceService {
       if (!this.rxChar) return;
       try {
           await this.rxChar.writeValue(new Uint8Array([byte]));
-          this.log(`TX [指令] >>> ${byte.toString(16).padStart(2,'0').toUpperCase()}`);
+          this.log(`TX [BYTE] >>> ${byte.toString(16).padStart(2,'0').toUpperCase()}`);
       } catch(e) {
            this.log(`写入错误: ${e}`);
       }
@@ -377,11 +336,19 @@ export class DeviceService {
   }
 
   // --------------------------------------------------------------------------
-  // 数据解析 (核心逻辑)
+  // 数据解析 (调试重点)
   // --------------------------------------------------------------------------
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
+      const newBytes = new Uint8Array(value.buffer);
+      
+      // 调试：打印收到的原始数据 (嗅探模式)
+      if (this.debugRawEnabled) {
+          const hex = Array.from(newBytes).map(b => b.toString(16).padStart(2,'0')).join(' ');
+          this.log(`RX RAW (${newBytes.length}): ${hex}`);
+      }
+
       for (let i = 0; i < value.byteLength; i++) {
           this.rawBuffer.push(value.getUint8(i));
       }
@@ -389,95 +356,80 @@ export class DeviceService {
   }
 
   private processRawBuffer() {
-      // 循环处理缓冲区，直到数据不足以构成一个包
+      // 保护机制：防止 buffer 无限增长
+      if (this.rawBuffer.length > 2048) {
+          this.log("Buffer overflow, clearing...");
+          this.rawBuffer = [];
+      }
+
       while (this.rawBuffer.length > 0) {
           // 1. 寻找帧头 0xAA
           const startIdx = this.rawBuffer.indexOf(0xAA);
           if (startIdx === -1) {
-              this.rawBuffer = []; // 没有帧头，丢弃所有数据
+              // 没找到头，如果是调试模式，看看里面是什么
+              // this.rawBuffer = []; 
+              // 暂时不丢弃全部，保留最后几个字节防止断包，但为了性能这里先丢弃
+              this.rawBuffer = [];
               return;
           }
           if (startIdx > 0) {
-              this.rawBuffer.splice(0, startIdx); // 丢弃帧头前面的垃圾数据
+              this.rawBuffer.splice(0, startIdx); 
           }
 
-          // 2. 检查最小长度 (AA Func Len ... CRC BB) 至少 5 字节
           if (this.rawBuffer.length < 5) return; 
 
-          const len = this.rawBuffer[3]; // 数据载荷长度
-          const frameSize = 6 + len; // 总帧长 = Header(1) + Func(1) + Len(1) + Data(0) + Payload(len) + CRC(1) + Tail(1) -- wait, protocol check
-          // 协议结构: AA [Func] [Register/Type] [Len] [Payload...] [CRC] BB ?
-          // 根据之前日志 "RX FUNC=20 LEN=1", 结构似乎是:
-          // Byte 0: AA
-          // Byte 1: Func (e.g., B0, 20, F1)
-          // Byte 2: sub-func? or just part of payload? 
-          // 让我们看之前的发送: AA B0 B0 03 ...
-          // Byte 0: AA
-          // Byte 1: Func (B0)
-          // Byte 2: SubFunc/Reg (B0) ? 
-          // Byte 3: Len (03)
+          const len = this.rawBuffer[3];
+          const frameSize = 6 + len; 
           
-          // 修正协议解析逻辑：基于 TX 包结构 "AA B0 B0 03 ... CRC BB"
-          // Byte 0: AA
-          // Byte 1: Func
-          // Byte 2: Sub/Reg
-          // Byte 3: Len
-          // ... Payload (Len bytes) ...
-          // Byte X: CRC
-          // Byte Y: BB
-          // 总长度 = 4 (Header部分) + Len + 2 (CRC+Tail) = 6 + Len
-          
-          if (this.rawBuffer.length < frameSize) return; // 数据包不完整，等待下一包
+          if (this.rawBuffer.length < frameSize) return; 
 
-          // 3. 检查帧尾 0xBB
+          // 2. 检查帧尾 0xBB
           if (this.rawBuffer[frameSize - 1] !== 0xBB) {
-              // 帧尾不对，可能是假头，丢弃当前 0xAA，继续寻找
               this.rawBuffer.shift(); 
               continue; 
           }
 
-          // 4. CRC 校验 (关键修复: 防止读取垃圾数据)
-          // 校验范围: 从 Func 到 Payload 结束 (不含 AA 和 BB)
-          // 对应索引: 1 到 frameSize - 3
+          // 3. CRC 校验
           const dataForCrc = this.rawBuffer.slice(1, frameSize - 2); 
           const receivedCrc = this.rawBuffer[frameSize - 2];
           const calculatedCrc = calculateCRC8(dataForCrc);
 
           if (receivedCrc !== calculatedCrc) {
-               this.log(`CRC 校验失败! Recv:${receivedCrc.toString(16)} Calc:${calculatedCrc.toString(16)}`);
-               this.rawBuffer.shift(); // 丢弃坏包
-               continue;
+               if (!this.ignoreCRC) {
+                   // 校验失败
+                   const hexDump = this.rawBuffer.slice(0, frameSize).map(b => b.toString(16).padStart(2,'0')).join(' ');
+                   this.log(`CRC失败 (Recv:${receivedCrc.toString(16)} Calc:${calculatedCrc.toString(16)}). Pkt: ${hexDump}`);
+                   this.rawBuffer.shift(); 
+                   continue;
+               } else {
+                   // 忽略 CRC，强制通过
+                   // this.log("CRC失败但强制通过");
+               }
           }
 
-          // 5. 解析有效载荷
+          // 4. 解析
           const func = this.rawBuffer[1];
           const payload = this.rawBuffer.slice(4, 4 + len);
           
           if (func === 0xF0 || func === 0xF1) {
-              // 脑电波形数据
               this.parseSamples(payload);
-          } else if (func >= 0x20 && func <= 0x39) {
-              // 寄存器数据 (Log it to know device state)
-              // 不需要显示太多，避免刷屏
-              // this.log(`RX 寄存器 [${func.toString(16)}]`);
-          } else if (func === 0xEE) {
-               // 心跳包
           } else {
-              this.log(`RX 未知指令 FUNC=${func.toString(16)} LEN=${len}`);
+              // 心跳或配置回显
+              if (!this.debugRawEnabled) { 
+                 // 避免重复刷屏，只在非 Raw 模式下提示功能码
+                 // this.log(`RX FUNC=${func.toString(16)}`); 
+              }
           }
 
-          // 移除已处理的数据包
           this.rawBuffer.splice(0, frameSize);
       }
   }
 
   private parseSamples(payload: number[]) {
-      // 24位 EEG 数据解析 (Big Endian)
       for (let i = 0; i < payload.length; i += 3) {
           if (i + 2 >= payload.length) break;
           
           let val = (payload[i] << 16) | (payload[i+1] << 8) | payload[i+2];
-          // 补码处理 (24-bit signed)
           if (val & 0x800000) val = val - 0x1000000;
           
           const uv = val * SCALE_FACTOR;

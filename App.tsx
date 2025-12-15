@@ -6,7 +6,7 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw, Disc, Copy, Send, Zap } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw, Disc, Copy, Send, Zap, Eye, AlertTriangle } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); 
@@ -26,8 +26,11 @@ const App: React.FC = () => {
   // 录制状态
   const [isRecording, setIsRecording] = useState(false);
   
-  // 手动指令
-  const [hexCmd, setHexCmd] = useState("02");
+  // 协议调试
+  const [debugRaw, setDebugRaw] = useState(false);
+  const [ignoreCRC, setIgnoreCRC] = useState(false);
+  const [cmdMode, setCmdMode] = useState<'HEX' | 'ASCII'>('HEX');
+  const [cmdInput, setCmdInput] = useState("02");
 
   const intervalRef = useRef<number | null>(null);
   const lastVoiceTime = useRef<number>(0);
@@ -135,25 +138,32 @@ const App: React.FC = () => {
         handleStopMonitoring();
     }
   };
+  
+  const handleSendCommand = async () => {
+      if (cmdMode === 'HEX') {
+          await signalProcessor.sendHexCommand(cmdInput);
+      } else {
+          await signalProcessor.sendASCIICommand(cmdInput);
+      }
+  };
+  
+  const toggleRawDebug = () => {
+      const newVal = !debugRaw;
+      setDebugRaw(newVal);
+      signalProcessor.setDebugRaw(newVal);
+  };
 
-  const handleRetryHandshake = async () => {
-      await signalProcessor.retryHandshake();
-  };
-  
-  const handleSendHex = async () => {
-      await signalProcessor.sendHexCommand(hexCmd);
-  };
-  
-  const handleQuickCommand = async (cmd: number) => {
-      await signalProcessor.sendRawByte(cmd);
+  const toggleIgnoreCRC = () => {
+      const newVal = !ignoreCRC;
+      setIgnoreCRC(newVal);
+      signalProcessor.setIgnoreCRC(newVal);
   };
 
   const toggleRecording = () => {
       if (isRecording) {
           const data = signalProcessor.stopRecording();
-          // 复制到剪贴板
           navigator.clipboard.writeText(data).then(() => {
-              alert("数据已复制到剪贴板！请粘贴发送。");
+              alert("数据已复制到剪贴板！");
           }).catch(err => {
               alert("无法复制，请查看日志控制台 (Recorded Data)");
           });
@@ -318,44 +328,68 @@ const App: React.FC = () => {
 
       {/* 开发者调试台 - 浮动在底部 */}
       <div className={`fixed bottom-0 left-0 right-0 bg-black/95 text-green-400 font-mono text-xs transition-transform duration-300 z-[100] border-t border-slate-700 ${showDebug ? 'translate-y-0' : 'translate-y-full'}`}>
-        <div className="flex justify-between items-center px-4 py-2 bg-slate-800 border-b border-slate-700">
-            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> 调试控制台 v2.7</span>
-            <div className="flex gap-2 items-center">
-                 <div className="flex items-center bg-slate-900 rounded border border-slate-700 mr-2">
-                    <input 
-                      type="text" 
-                      value={hexCmd} 
-                      onChange={(e) => setHexCmd(e.target.value)}
-                      className="bg-transparent text-white w-20 px-2 py-1 outline-none uppercase placeholder-slate-600"
-                      placeholder="HEX"
-                    />
-                    <button onClick={handleSendHex} className="p-1 hover:text-sky-400 border-l border-slate-700"><Send size={12}/></button>
-                 </div>
-                 
-                 <button onClick={() => handleQuickCommand(0x02)} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600" title="发送 0x02 (启动)">
-                    启动 (02)
+        <div className="flex flex-col border-b border-slate-700">
+            {/* 上半部分：标题和状态栏 */}
+            <div className="flex justify-between items-center px-4 py-2 bg-slate-800">
+                <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> 调试 v2.8</span>
+                <div className="flex gap-2 items-center">
+                    {/* 指令输入区域 */}
+                    <div className="flex items-center bg-slate-900 rounded border border-slate-700 mr-2">
+                        <button 
+                            onClick={() => setCmdMode(m => m === 'HEX' ? 'ASCII' : 'HEX')}
+                            className="px-2 py-1 text-[10px] bg-slate-800 border-r border-slate-700 text-slate-300 w-12"
+                        >
+                            {cmdMode}
+                        </button>
+                        <input 
+                        type="text" 
+                        value={cmdInput} 
+                        onChange={(e) => setCmdInput(e.target.value)}
+                        className="bg-transparent text-white w-24 px-2 py-1 outline-none uppercase placeholder-slate-600"
+                        placeholder={cmdMode === 'HEX' ? "02" : "b"}
+                        />
+                        <button onClick={handleSendCommand} className="p-1 hover:text-sky-400 border-l border-slate-700"><Send size={12}/></button>
+                    </div>
+                    
+                    <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white ml-2"><X size={16}/></button>
+                </div>
+            </div>
+
+            {/* 下半部分：高级工具栏 */}
+            <div className="flex gap-2 px-4 py-1.5 bg-slate-800/50 overflow-x-auto">
+                 {/* 强制解析开关 */}
+                 <button 
+                    onClick={toggleIgnoreCRC}
+                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs border ${ignoreCRC ? 'bg-amber-500/20 border-amber-500 text-amber-400' : 'bg-slate-700 border-slate-600 text-slate-400'}`}
+                    title="忽略CRC错误"
+                 >
+                    <AlertTriangle size={12}/> 强制解析 {ignoreCRC ? "ON" : "OFF"}
                  </button>
-                 
-                <button 
-                  onClick={toggleRecording} 
-                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs text-white border ${isRecording ? 'bg-red-600 border-red-500 animate-pulse' : 'bg-slate-700 border-slate-600 hover:bg-slate-600'}`}
-                >
-                   {isRecording ? <><Copy size={12}/> 停止录制</> : <><Disc size={12}/> 开始录制</>}
-                </button>
-                <button 
-                  onClick={handleRetryHandshake} 
-                  className="flex items-center gap-1 px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600"
-                  title="切换握手策略"
-                >
-                   <RefreshCw size={12}/>
-                </button>
-                <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white ml-2"><X size={16}/></button>
+
+                 {/* 原始数据嗅探 */}
+                 <button 
+                    onClick={toggleRawDebug}
+                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs border ${debugRaw ? 'bg-sky-500/20 border-sky-500 text-sky-400' : 'bg-slate-700 border-slate-600 text-slate-400'}`}
+                    title="显示原始 HEX 数据"
+                 >
+                    <Eye size={12}/> 嗅探 {debugRaw ? "ON" : "OFF"}
+                 </button>
+
+                 <div className="w-px h-4 bg-slate-700 mx-1"></div>
+
+                 <button 
+                    onClick={toggleRecording} 
+                    className={`flex items-center gap-1 px-2 py-1 rounded text-xs text-white border ${isRecording ? 'bg-red-600 border-red-500 animate-pulse' : 'bg-slate-700 border-slate-600 hover:bg-slate-600'}`}
+                 >
+                    {isRecording ? <><Copy size={12}/> 停止</> : <><Disc size={12}/> 录制</>}
+                 </button>
             </div>
         </div>
-        <div className="h-40 overflow-y-auto p-4 space-y-1">
-            {logs.length === 0 && <span className="text-slate-600">等待连接或数据...</span>}
+
+        <div className="h-40 overflow-y-auto p-4 space-y-1 font-mono text-[11px] leading-tight">
+            {logs.length === 0 && <span className="text-slate-600">等待数据... 请开启“嗅探”查看原始字节。</span>}
             {logs.map((log, i) => (
-                <div key={i} className="break-all border-b border-slate-800/50 pb-1">{log}</div>
+                <div key={i} className="break-all border-b border-slate-800/30 pb-1">{log}</div>
             ))}
             <div ref={logsEndRef} />
         </div>
