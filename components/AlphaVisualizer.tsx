@@ -14,8 +14,6 @@ interface Particle {
   vy: number;
   radius: number;
   alpha: number;
-  targetX?: number;
-  targetY?: number;
   phase: number;
 }
 
@@ -23,6 +21,12 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const particlesRef = useRef<Particle[]>([]);
   const frameIdRef = useRef<number>(0);
+  
+  // 用于平滑动画的内部状态
+  const smoothState = useRef({
+      alpha: 0,
+      relaxation: 0
+  });
 
   // Initialize particles
   useEffect(() => {
@@ -53,52 +57,51 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
     const centerY = height / 2;
 
     const render = () => {
+      // 1. 线性插值 (LERP) 使动画状态平滑过渡
+      // 每一帧只移动 5% 的距离，消除了数值跳动
+      smoothState.current.alpha += (alphaPower - smoothState.current.alpha) * 0.05;
+      smoothState.current.relaxation += (relaxationScore - smoothState.current.relaxation) * 0.05;
+
+      const currentRel = smoothState.current.relaxation;
+      const currentAlpha = smoothState.current.alpha;
+
       // Clear canvas with a very slight trail effect
       ctx.fillStyle = 'rgba(15, 23, 42, 0.2)'; 
       ctx.fillRect(0, 0, width, height);
 
-      // Determine state
-      // Relaxation 0.0 -> Scattered randomly
-      // Relaxation 1.0 -> Condensed in center
-      
-      const isRelaxed = relaxationScore > 0.6;
-      const coreRadius = 40 + alphaPower * 0.5; // Base size fluctuates with Alpha
+      const isRelaxed = currentRel > 0.6;
+      const coreRadius = 40 + currentAlpha * 0.5; 
       
       particlesRef.current.forEach((p, i) => {
         p.phase += 0.05;
         
         if (isRelaxed) {
             // --- CONDENSED MODE (Light Ball) ---
-            // Particles orbit the center or stick to surface
             const angle = (i / particlesRef.current.length) * Math.PI * 2 + p.phase * 0.1;
-            // Target distance from center based on relaxation score (tighter when more relaxed)
-            const tightness = 1 - Math.min(1, relaxationScore); 
+            // 松弛状态下收缩
+            const tightness = 1 - Math.min(1, currentRel); 
             const targetDist = coreRadius * (0.8 + Math.sin(p.phase)*0.2) + (tightness * 100);
             
             const targetX = centerX + Math.cos(angle) * targetDist;
             const targetY = centerY + Math.sin(angle) * targetDist;
             
-            // Move towards target
             p.x += (targetX - p.x) * 0.05;
             p.y += (targetY - p.y) * 0.05;
             
-            // Add some jitter/energy
             p.x += (Math.random() - 0.5) * 2;
             p.y += (Math.random() - 0.5) * 2;
 
         } else {
             // --- SCATTERED MODE (Starlight) ---
-            // Particles drift freely
             p.x += p.vx + (Math.random()-0.5)*0.5;
             p.y += p.vy + (Math.random()-0.5)*0.5;
             
-            // Soft boundaries - wrap around
             if (p.x < 0) p.x = width;
             if (p.x > width) p.x = 0;
             if (p.y < 0) p.y = height;
             if (p.y > height) p.y = 0;
             
-            // Push away from center slightly if very agitated
+            // 如果非常不放松，粒子会轻微远离中心
             const dx = p.x - centerX;
             const dy = p.y - centerY;
             const dist = Math.sqrt(dx*dx + dy*dy);
@@ -108,12 +111,11 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
             }
         }
 
-        // Draw Particle
         ctx.beginPath();
         const flicker = 0.5 + 0.5 * Math.sin(p.phase);
         ctx.globalAlpha = p.alpha * flicker;
         
-        // Color transition: White/Blue -> Gold/Green based on state
+        // Color transition
         if (isMeditating) {
             ctx.fillStyle = `hsl(160, 100%, ${50 + flicker * 50}%)`; // Greenish Cyan
         } else if (isRelaxed) {
@@ -127,9 +129,9 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
         ctx.globalAlpha = 1.0;
       });
 
-      // Draw Core Glow when relaxed
-      if (relaxationScore > 0.3) {
-          const glowSize = coreRadius * relaxationScore * 1.5;
+      // Draw Core Glow
+      if (currentRel > 0.3) {
+          const glowSize = coreRadius * currentRel * 1.5;
           const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, glowSize);
           
           if (isMeditating) {
@@ -161,10 +163,10 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
   return (
     <div className="relative flex flex-col items-center justify-center h-full w-full min-h-[400px]">
       <div className="absolute top-6 text-center z-10 pointer-events-none">
-        <h2 className={`text-3xl font-light tracking-tight transition-colors duration-500 ${isMeditating ? 'text-emerald-400' : 'text-slate-100'}`}>
+        <h2 className={`text-3xl font-light tracking-tight transition-colors duration-1000 ${isMeditating ? 'text-emerald-400' : 'text-slate-100'}`}>
           {isMeditating ? textMap.meditation_state : textMap.active_mind}
         </h2>
-        <p className="text-slate-400 text-sm mt-1 font-mono">
+        <p className="text-slate-400 text-sm mt-1 font-mono transition-opacity duration-500">
           {textMap.alpha_index}: {alphaPower.toFixed(1)}
         </p>
       </div>
@@ -177,12 +179,12 @@ export const AlphaVisualizer: React.FC<AlphaVisualizerProps> = ({ alphaPower, re
       />
       
       <div className="absolute bottom-6 text-center pointer-events-none">
-         <div className={`inline-flex items-center px-4 py-2 rounded-full border backdrop-blur-md transition-all duration-700 ${
+         <div className={`inline-flex items-center px-4 py-2 rounded-full border backdrop-blur-md transition-all duration-1000 ${
              isMeditating 
              ? 'bg-emerald-900/30 border-emerald-500/50 shadow-[0_0_20px_rgba(16,185,129,0.3)]' 
              : 'bg-slate-800/50 border-slate-700'
          }`}>
-            <span className={`text-sm font-medium ${isMeditating ? 'text-emerald-300' : 'text-slate-300'}`}>
+            <span className={`text-sm font-medium transition-colors duration-1000 ${isMeditating ? 'text-emerald-300' : 'text-slate-300'}`}>
               {isMeditating ? textMap.target_achieved : textMap.focus_breath}
             </span>
          </div>

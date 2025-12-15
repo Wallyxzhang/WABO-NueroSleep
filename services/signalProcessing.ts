@@ -37,12 +37,12 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.5 (Filter Init & Slew Limit)";
+const VERSION = "v3.6 (Zen Smooth Mode)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
 
-const SCALE_FACTOR = 0.01192; // 转换系数
+const SCALE_FACTOR = 0.01192; 
 const SAMPLE_RATE = 250; 
 const FFT_SIZE = 256; 
 
@@ -72,14 +72,18 @@ function calculateCRC8(data: Uint8Array | number[]): number {
 
 class SignalProcessor {
     private buffer: number[] = [];
-    private prevInput: number | null = null; // Changed to null for initialization check
+    private prevInput: number | null = null;
     private prevOutput: number = 0;
     
-    // 中值滤波缓存 (去除脉冲噪声)
+    // 中值滤波缓存
     private medianBuffer: number[] = [];
     
-    // Slew Rate Limiter (防止突变)
+    // Slew Rate Limiter
     private lastValidRaw: number | null = null;
+
+    // --- 平滑处理状态 (Zen Mode) ---
+    private smoothBands: FrequencyBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
+    private signalQuality: number = 1.0; // 1.0 = Good, 0.0 = Bad (Noise)
 
     reset() {
         this.buffer = [];
@@ -87,17 +91,16 @@ class SignalProcessor {
         this.prevOutput = 0;
         this.medianBuffer = [];
         this.lastValidRaw = null;
+        this.smoothBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
     }
 
-    process(sample: number): number {
-        // 0. Slew Rate Limiter (跳变抑制)
-        // EEG 信号在 4ms (250Hz) 内不可能跳变超过 5000uV (5mV)。
-        // 如果跳变过大，很可能是解析错误或伪迹，保持上一个值。
+    process(sample: number): { filtered: number, quality: number } {
+        // 0. Slew Rate Limiter (防突变)
+        // 增加容差到 10000，避免误杀大幅度的眼动信号（我们需要保留它但不计入冥想分）
         let cleanSample = sample;
         if (this.lastValidRaw !== null) {
             const diff = Math.abs(sample - this.lastValidRaw);
-            if (diff > 5000) { 
-                // 忽略这个突变点，使用上一个有效值
+            if (diff > 10000) { 
                 cleanSample = this.lastValidRaw;
             } else {
                 this.lastValidRaw = sample;
@@ -106,7 +109,7 @@ class SignalProcessor {
             this.lastValidRaw = sample;
         }
 
-        // 1. 中值滤波 (Median Filter) 
+        // 1. 中值滤波
         this.medianBuffer.push(cleanSample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
@@ -119,12 +122,11 @@ class SignalProcessor {
             filteredSample = sorted[mid];
         }
 
-        // 2. 去直流漂移 (High-pass Filter)
-        // 初始化逻辑：如果这是第一个点，初始化 prevInput 为当前值，这样 output 为 0
+        // 2. 去直流 (High-pass)
         if (this.prevInput === null) {
             this.prevInput = filteredSample;
             this.prevOutput = 0;
-            return 0;
+            return { filtered: 0, quality: 1 };
         }
 
         const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
@@ -135,7 +137,21 @@ class SignalProcessor {
         if (this.buffer.length > FFT_SIZE) {
             this.buffer.shift();
         }
-        return output;
+
+        // 3. 信号质量检测 (Signal Quality)
+        // 如果信号幅度过大 (>200uV)，通常是肌电或眼动伪迹
+        // 我们计算最近的平均振幅来判断
+        let quality = 1.0;
+        if (Math.abs(output) > 150) {
+            quality = 0.0; // 强噪音
+        } else if (Math.abs(output) > 80) {
+            quality = 0.5; // 轻微噪音
+        }
+        
+        // 平滑质量指标
+        this.signalQuality = this.signalQuality * 0.9 + quality * 0.1;
+
+        return { filtered: output, quality: this.signalQuality };
     }
 
     getFFT(): FrequencyBands {
@@ -167,13 +183,26 @@ class SignalProcessor {
             return count > 0 ? sum / count : 0;
         };
 
-        return {
+        const instantBands = {
             delta: getPower(0.5, 4),
             theta: getPower(4, 8),
             alpha: getPower(8, 14),
             beta: getPower(14, 28),
             gamma: getPower(28, 40)
         };
+
+        // 4. 频段数据的深度平滑 (Deep Smoothing)
+        // alpha系数越小，变化越慢。0.05 意味着新数据只占 5% 权重。
+        // 这模拟了呼吸般的缓慢节奏。
+        const smoothFactor = 0.05; 
+        
+        this.smoothBands.delta = this.smoothBands.delta * (1-smoothFactor) + instantBands.delta * smoothFactor;
+        this.smoothBands.theta = this.smoothBands.theta * (1-smoothFactor) + instantBands.theta * smoothFactor;
+        this.smoothBands.alpha = this.smoothBands.alpha * (1-smoothFactor) + instantBands.alpha * smoothFactor;
+        this.smoothBands.beta  = this.smoothBands.beta  * (1-smoothFactor) + instantBands.beta  * smoothFactor;
+        this.smoothBands.gamma = this.smoothBands.gamma * (1-smoothFactor) + instantBands.gamma * smoothFactor;
+
+        return { ...this.smoothBands };
     }
 }
 
@@ -261,7 +290,7 @@ export class DeviceService {
 
     try {
       this.log(`正在初始化 ${VERSION}...`);
-      this.dsp.reset(); // 重置滤波器状态
+      this.dsp.reset(); 
       
       this.device = await (navigator as any).bluetooth.requestDevice({
         filters: [{ namePrefix: 'SILI' }], 
@@ -285,13 +314,9 @@ export class DeviceService {
       await txChar.startNotifications();
       txChar.addEventListener('characteristicvaluechanged', this.handleBluetoothData.bind(this));
 
-      // 自动配置重试逻辑
       this.log("正在尝试自动配置...");
-      // 延迟 500ms 发送第一次
       await new Promise(r => setTimeout(r, 500));
       await this.performAutoConfig();
-      
-      // 再延迟 1000ms 发送第二次 (确保设备已就绪)
       await new Promise(r => setTimeout(r, 1000));
       await this.performAutoConfig();
 
@@ -443,25 +468,15 @@ export class DeviceService {
           let val = 0;
           
           if (offset === 0) {
-              // --- 第一个样本 (6字节) ---
-              // 格式: [S0, S1, S2, D0, D1, D2]
               if (offset + 6 > payload.length) break;
-              
-              // Little Endian: D0=p[3], D1=p[4], D2=p[5]
               val = (payload[offset+5] << 16) | (payload[offset+4] << 8) | payload[offset+3];
-              
               offset += 6;
           } else {
-              // --- 后续样本 (4字节) ---
-              // 格式: [S0, D0, D1, D2]
               if (offset + 4 > payload.length) break;
-              
               val = (payload[offset+3] << 16) | (payload[offset+2] << 8) | payload[offset+1];
-              
               offset += 4;
           }
 
-          // 24-bit 补码符号扩展
           if (val & 0x800000) {
               val = val | 0xFF000000;
           }
@@ -484,25 +499,30 @@ export class DeviceService {
           this.recordedData.push(uv);
       }
 
-      const filtered = this.dsp.process(uv);
+      // 1. 信号处理
+      const { filtered, quality } = this.dsp.process(uv);
       
-      // 只有在滤波器初始化完成后(不是0)才开始更新UI数据，避免初始的0直线
       if (filtered !== 0) {
           this.latestData.raw = { timestamp: Date.now(), value: filtered };
           
           const bands = this.dsp.getFFT();
           
+          // 2. 指数计算
           const eps = 0.1;
           const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
           
           const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
           const attMetric = (bands.beta + bands.gamma) / totalPower;
 
-          // 平滑处理
-          const prevRel = this.latestData.metrics.relaxation;
-          const smoothRel = prevRel * 0.92 + Math.min(1.0, relMetric) * 0.08;
+          // 3. 极度平滑的用户反馈指标 (Zen Smoothing)
+          // 如果信号质量差（干扰大），我们“冻结”指标变化，或者让它极其缓慢地变化，避免干扰数据造成用户困惑。
+          // 正常权重 0.02 (非常慢), 噪音时权重 0.005 (几乎不动)
+          const metricWeight = quality > 0.8 ? 0.02 : 0.005;
           
-          const smoothAtt = this.latestData.metrics.attention * 0.9 + attMetric * 0.1;
+          const prevRel = this.latestData.metrics.relaxation;
+          const smoothRel = prevRel * (1 - metricWeight) + Math.min(1.0, relMetric) * metricWeight;
+          
+          const smoothAtt = this.latestData.metrics.attention * (1 - metricWeight) + attMetric * metricWeight;
 
           this.latestData.bands = bands;
           this.latestData.metrics = {
@@ -552,10 +572,14 @@ export class DeviceService {
   private updateSimulation() {
     this.agitationLevel = Math.max(0, this.agitationLevel * 0.9);
     const rel = Math.max(0, 1 - (this.agitationLevel / 50));
+    // 模拟数据也要平滑
+    const prevRel = this.latestData.metrics.relaxation;
+    const smoothRel = prevRel * 0.95 + rel * 0.05;
+    
     this.latestData = {
         raw: { timestamp: Date.now(), value: Math.sin(Date.now()/50)*10 + (Math.random()-0.5)*5 },
-        bands: { delta: 5, theta: 5, alpha: rel*40, beta: (1-rel)*20, gamma: 5 },
-        metrics: { relaxation: rel, attention: 1-rel, isMeditating: rel > 0.8 }
+        bands: { delta: 5, theta: 5, alpha: smoothRel*40, beta: (1-smoothRel)*20, gamma: 5 },
+        metrics: { relaxation: smoothRel, attention: 1-smoothRel, isMeditating: smoothRel > 0.8 }
     };
   }
 }
