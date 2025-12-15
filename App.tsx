@@ -288,7 +288,7 @@ const App: React.FC = () => {
       {/* 开发者调试台 - 浮动在底部 */}
       <div className={`fixed bottom-0 left-0 right-0 bg-black/90 text-green-400 font-mono text-xs transition-transform duration-300 z-[100] border-t border-slate-700 ${showDebug ? 'translate-y-0' : 'translate-y-full'}`}>
         <div className="flex justify-between items-center px-4 py-2 bg-slate-800 border-b border-slate-700">
-            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.3</span>
+            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.4</span>
             <div className="flex gap-2">
                 <button 
                   onClick={handleRetryHandshake} 

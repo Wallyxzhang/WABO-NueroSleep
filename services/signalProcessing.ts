@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // Configuration
 // --------------------------------------------------------------------------
 
-const VERSION = "v2.3 (Retry & Delay)";
+const VERSION = "v2.4 (Protocol Fix F1)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
@@ -151,7 +151,9 @@ export class DeviceService {
   private simulationInterval: number | null = null;
   
   // Retry state
-  private retryMode: number = 0; // 0: Name ID, 1: Zero ID, 2: Reverse ID
+  // Default to 1 (ZeroID) because logs confirm it works (returns F1 data), 
+  // while NameID returned 20/22/24 (status/config).
+  private retryMode: number = 1; 
 
   public setLogger(cb: LogCallback) {
     this.logCallback = cb;
@@ -207,8 +209,7 @@ export class DeviceService {
       this.log("等待通道稳定 (1秒)...");
       await new Promise(resolve => setTimeout(resolve, 1000));
 
-      // Initial Handshake
-      this.retryMode = 0;
+      // Initial Handshake - will use retryMode=1 (ZeroID) by default now
       await this.performHandshake();
       
       return true;
@@ -305,13 +306,9 @@ export class DeviceService {
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
-      if (value.byteLength > 0) {
-          // Log raw data reception to confirm channel is open
-          // Only log first few bytes to avoid spam
-          // const preview = Array.from(new Uint8Array(value.buffer).slice(0, 5)).map(b => b.toString(16)).join(' ');
-          // this.log(`RX <<< [${value.byteLength}] ${preview}...`);
-      }
-
+      // Logging raw bytes is noisy, but good for debug if needed.
+      // Keeping it disabled for performance unless debug needed.
+      
       for (let i = 0; i < value.byteLength; i++) {
           this.rawBuffer.push(value.getUint8(i));
       }
@@ -337,7 +334,8 @@ export class DeviceService {
           if (this.rawBuffer.length < frameSize) return; 
 
           if (this.rawBuffer[frameSize - 1] !== 0xBB) {
-              this.log(`RX Bad Tail: ${this.rawBuffer[frameSize - 1].toString(16)}`);
+              // Only log if it's not a common fragmentation issue
+              // this.log(`RX Bad Tail: ${this.rawBuffer[frameSize - 1].toString(16)}`);
               this.rawBuffer.shift(); 
               continue; 
           }
@@ -345,8 +343,12 @@ export class DeviceService {
           const func = this.rawBuffer[1];
           const payload = this.rawBuffer.slice(4, 4 + len);
           
-          if (func === 0xF0) {
+          // CRITICAL FIX: Accept 0xF1 as valid data packet (seen in user logs)
+          if (func === 0xF0 || func === 0xF1) {
               this.parseSamples(payload);
+          } else if (func === 0xEE) {
+               // Heartbeat or Ack, ignore silently or log
+               // this.log("RX: ACK (EE)");
           } else {
               this.log(`RX FUNC=${func.toString(16)} LEN=${len}`);
           }
