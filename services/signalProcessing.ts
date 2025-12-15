@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // Configuration & Constants
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.8 (Channel Fix)";
+const VERSION = "v3.9 (Wide Range)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -75,17 +75,18 @@ class SignalProcessor {
     private buffer: number[] = [];
     private prevInput: number | null = null;
     private prevOutput: number = 0;
+    private lpfPrev: number = 0; // Low Pass Filter State
     
     // Filters
     private medianBuffer: number[] = [];
     private lastValidRaw: number | null = null;
     private slewViolationCounter: number = 0;
 
-    // Artifact Shield (V3.7)
+    // Artifact Shield (V3.9)
     // Lockout countdown in samples. If > 0, we consider the signal noisy.
     private artifactLockout: number = 0;
     private readonly ARTIFACT_DURATION = 125; // 0.5 seconds lockout on spike
-    private readonly NOISE_THRESHOLD_UV = 200; // Values > 200uV (after filtering) are artifacts
+    private readonly NOISE_THRESHOLD_UV = 1500; // V3.9: Increased from 200 to 1500 to allow noisy data flow
 
     // Time-Window Buffering (V3.7)
     // Stores relative power bands for smoothing
@@ -96,6 +97,7 @@ class SignalProcessor {
         this.buffer = [];
         this.prevInput = null;
         this.prevOutput = 0;
+        this.lpfPrev = 0;
         this.medianBuffer = [];
         this.lastValidRaw = null;
         this.slewViolationCounter = 0;
@@ -147,22 +149,31 @@ class SignalProcessor {
         if (this.prevInput === null) {
             this.prevInput = filteredSample;
             this.prevOutput = 0;
+            this.lpfPrev = 0;
             return { filtered: 0, quality: 1 };
         }
 
-        const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
+        const hpOutput = filteredSample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = filteredSample;
-        this.prevOutput = output;
+        this.prevOutput = hpOutput;
+
+        // 4. Low-Pass Filter (V3.9 - New)
+        // Smooth out high frequency jitter/EMG (>30Hz). 
+        // Simple exponential smoothing factor 0.3 (~30-40Hz cutoff)
+        const lpOutput = this.lpfPrev + 0.3 * (hpOutput - this.lpfPrev);
+        this.lpfPrev = lpOutput;
         
-        // 4. Update FFT Buffer
-        this.buffer.push(output);
+        const finalOutput = lpOutput;
+        
+        // 5. Update FFT Buffer
+        this.buffer.push(finalOutput);
         if (this.buffer.length > FFT_SIZE) {
             this.buffer.shift();
         }
 
-        // 5. Artifact Detection (Noise Gate)
+        // 6. Artifact Detection (Noise Gate)
         // If amplitude is too high, it's likely EMG (muscle) or EOG (eye) artifact.
-        if (Math.abs(output) > this.NOISE_THRESHOLD_UV) {
+        if (Math.abs(finalOutput) > this.NOISE_THRESHOLD_UV) {
             this.artifactLockout = this.ARTIFACT_DURATION;
         }
 
@@ -173,15 +184,17 @@ class SignalProcessor {
         // Quality metric: 1.0 = Clean, 0.0 = Artifact
         const quality = this.artifactLockout > 0 ? 0.0 : 1.0;
 
-        return { filtered: output, quality };
+        return { filtered: finalOutput, quality };
     }
 
     // Calculates Relative Power (%) smoothed over time
     getSmoothedBands(): FrequencyBands | null {
         if (this.buffer.length < FFT_SIZE) return null;
         
-        // If we are currently in an artifact state, return null to freeze UI
-        if (this.artifactLockout > 0) return null;
+        // V3.9: We NO LONGER return null here on artifacts.
+        // We allow the FFT to run so the UI updates, but the 'quality' metric
+        // will inform the user if the data is suspect.
+        // if (this.artifactLockout > 0) return null; 
 
         // Perform FFT
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
@@ -476,9 +489,14 @@ export class DeviceService {
               return; 
           }
 
-          if (this.rawBuffer[frameSize - 1] !== PROTOCOL_END) {
-              this.rawBuffer.shift(); 
-              continue;
+          if (this.rawBuffer.length < frameSize || this.rawBuffer[frameSize - 1] !== PROTOCOL_END) {
+              if(this.rawBuffer.length >= frameSize && this.rawBuffer[frameSize - 1] !== PROTOCOL_END) {
+                  // Frame misalignment correction: if end byte is not where expected, shift 1
+                  this.rawBuffer.shift(); 
+                  continue;
+              }
+              // Not enough data yet
+              return; 
           }
 
           const calcData = this.rawBuffer.slice(1, frameSize - 2);
@@ -527,10 +545,7 @@ export class DeviceService {
       let channelIndex = 0; // 0 = Ch1, 1 = Ch2
 
       while (offset + 3 <= payload.length) {
-          // Read 3 bytes (24-bit) - Little Endian (Standard for these modules)
-          // Format: [LSB] [Mid] [MSB]
-          // If previous code was shifting +5, +4, +3, that was Big Endian or Mixed.
-          // Let's assume Little Endian based on typical TGAM/Sili behavior:
+          // Read 3 bytes (24-bit) - Little Endian
           const val = (payload[offset+2] << 16) | (payload[offset+1] << 8) | payload[offset];
           
           let signedVal = val;
