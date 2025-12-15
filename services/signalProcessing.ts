@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // Configuration
 // --------------------------------------------------------------------------
 
-const VERSION = "v2.5 (Data Recorder)";
+const VERSION = "v2.6 (Hex Commander)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
@@ -101,7 +101,6 @@ class SignalProcessor {
                  imag += windowed[n] * Math.sin(theta);
              }
              // FIXED: Normalize FFT magnitude by dividing by (N/2)
-             // Before: Values proportional to N (~128x too large). Now: True amplitude in uV.
              mags[k] = (2 * Math.sqrt(real * real + imag * imag)) / FFT_SIZE;
         }
         
@@ -189,7 +188,9 @@ export class DeviceService {
   public stopRecording(): string {
       this.isRecording = false;
       this.log(`>>> 录制结束。共采集 ${this.recordedData.length} 个点。`);
-      return JSON.stringify(this.recordedData);
+      const json = JSON.stringify(this.recordedData);
+      console.log("Recorded Data:", json); // Dump to console in case clipboard fails
+      return json;
   }
 
   public getIsRecording() { return this.isRecording; }
@@ -301,6 +302,40 @@ export class DeviceService {
       await this.performHandshake();
   }
 
+  // Debug Method: Send arbitrary hex string or raw bytes
+  public async sendHexCommand(hex: string) {
+      if (!this.rxChar) return;
+      
+      // Clean string
+      const cleanHex = hex.replace(/[^0-9A-Fa-f]/g, '');
+      if (cleanHex.length % 2 !== 0) {
+          this.log("错误: Hex 长度必须是偶数");
+          return;
+      }
+      
+      const bytes = new Uint8Array(cleanHex.length / 2);
+      for (let i = 0; i < cleanHex.length; i += 2) {
+          bytes[i / 2] = parseInt(cleanHex.substring(i, i + 2), 16);
+      }
+      
+      this.log(`TX [MANUAL] >>> ${Array.from(bytes).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`);
+      try {
+          await this.rxChar.writeValue(bytes);
+      } catch(e) {
+          this.log(`写入错误: ${e}`);
+      }
+  }
+
+  public async sendRawByte(byte: number) {
+      if (!this.rxChar) return;
+      try {
+          await this.rxChar.writeValue(new Uint8Array([byte]));
+          this.log(`TX [RAW] >>> ${byte.toString(16).padStart(2,'0').toUpperCase()}`);
+      } catch(e) {
+           this.log(`写入错误: ${e}`);
+      }
+  }
+
   public disconnect() {
     if (this.isSimulating) {
         this.stopSimulation();
@@ -364,7 +399,8 @@ export class DeviceService {
           } else if (func === 0xEE) {
                // Heartbeat
           } else {
-              this.log(`RX FUNC=${func.toString(16)} LEN=${len}`);
+              // Log specific register dumps to help debug
+              this.log(`RX FUNC=${func.toString(16)} LEN=${len} PL=${Array.from(payload).map(x=>x.toString(16)).join('')}`);
           }
 
           this.rawBuffer.splice(0, frameSize);
