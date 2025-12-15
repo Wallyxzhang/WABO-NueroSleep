@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.4 (Protocol Aligned)";
+const VERSION = "v3.5 (Filter Init & Slew Limit)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -72,20 +72,47 @@ function calculateCRC8(data: Uint8Array | number[]): number {
 
 class SignalProcessor {
     private buffer: number[] = [];
-    private prevInput: number = 0;
+    private prevInput: number | null = null; // Changed to null for initialization check
     private prevOutput: number = 0;
     
     // 中值滤波缓存 (去除脉冲噪声)
     private medianBuffer: number[] = [];
+    
+    // Slew Rate Limiter (防止突变)
+    private lastValidRaw: number | null = null;
+
+    reset() {
+        this.buffer = [];
+        this.prevInput = null;
+        this.prevOutput = 0;
+        this.medianBuffer = [];
+        this.lastValidRaw = null;
+    }
 
     process(sample: number): number {
+        // 0. Slew Rate Limiter (跳变抑制)
+        // EEG 信号在 4ms (250Hz) 内不可能跳变超过 5000uV (5mV)。
+        // 如果跳变过大，很可能是解析错误或伪迹，保持上一个值。
+        let cleanSample = sample;
+        if (this.lastValidRaw !== null) {
+            const diff = Math.abs(sample - this.lastValidRaw);
+            if (diff > 5000) { 
+                // 忽略这个突变点，使用上一个有效值
+                cleanSample = this.lastValidRaw;
+            } else {
+                this.lastValidRaw = sample;
+            }
+        } else {
+            this.lastValidRaw = sample;
+        }
+
         // 1. 中值滤波 (Median Filter) 
-        this.medianBuffer.push(sample);
+        this.medianBuffer.push(cleanSample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
         }
         
-        let filteredSample = sample;
+        let filteredSample = cleanSample;
         if (this.medianBuffer.length >= 3) {
             const sorted = [...this.medianBuffer].sort((a, b) => a - b);
             const mid = Math.floor(sorted.length / 2);
@@ -93,7 +120,13 @@ class SignalProcessor {
         }
 
         // 2. 去直流漂移 (High-pass Filter)
-        // 0.995 是极点，决定了截止频率。对于EEG信号，去除直流偏置非常重要。
+        // 初始化逻辑：如果这是第一个点，初始化 prevInput 为当前值，这样 output 为 0
+        if (this.prevInput === null) {
+            this.prevInput = filteredSample;
+            this.prevOutput = 0;
+            return 0;
+        }
+
         const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = filteredSample;
         this.prevOutput = output;
@@ -228,6 +261,7 @@ export class DeviceService {
 
     try {
       this.log(`正在初始化 ${VERSION}...`);
+      this.dsp.reset(); // 重置滤波器状态
       
       this.device = await (navigator as any).bluetooth.requestDevice({
         filters: [{ namePrefix: 'SILI' }], 
@@ -251,9 +285,16 @@ export class DeviceService {
       await txChar.startNotifications();
       txChar.addEventListener('characteristicvaluechanged', this.handleBluetoothData.bind(this));
 
+      // 自动配置重试逻辑
+      this.log("正在尝试自动配置...");
+      // 延迟 500ms 发送第一次
       await new Promise(r => setTimeout(r, 500));
       await this.performAutoConfig();
       
+      // 再延迟 1000ms 发送第二次 (确保设备已就绪)
+      await new Promise(r => setTimeout(r, 1000));
+      await this.performAutoConfig();
+
       return true;
 
     } catch (e: any) {
@@ -311,6 +352,7 @@ export class DeviceService {
     this.server = null;
     this.isConnected = false;
     this.rawBuffer = [];
+    this.dsp.reset();
     this.log("蓝牙已断开");
   }
 
@@ -321,7 +363,6 @@ export class DeviceService {
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
-      // 必须使用 byteOffset，否则在 Android/Chrome 上可能读取到错误的内存区域
       const newBytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
       
       if (this.debugRawEnabled) {
@@ -342,21 +383,20 @@ export class DeviceService {
       }
 
       while (this.rawBuffer.length >= 7) {
-          // 查找帧头
           if (this.rawBuffer[0] !== PROTOCOL_START) {
               this.rawBuffer.shift();
               continue;
           }
 
           const payloadLen = this.rawBuffer[3];
-          const frameSize = 6 + payloadLen; // Header(4) + Payload(Len) + CRC(1) + End(1)
+          const frameSize = 6 + payloadLen; 
 
           if (this.rawBuffer.length < frameSize) {
-              return; // 数据未收全
+              return; 
           }
 
           if (this.rawBuffer[frameSize - 1] !== PROTOCOL_END) {
-              this.rawBuffer.shift(); // 帧尾不匹配，滑动窗口
+              this.rawBuffer.shift(); 
               continue;
           }
 
@@ -397,11 +437,6 @@ export class DeviceService {
   }
 
   private parseADCData(payload: number[]) {
-      // 根据 SW3011 协议文档 4.3 节：
-      // 缓冲深度 > 1 (0x60 自动配置通常会开启8倍或32倍缓冲)
-      // 第 1 个样本：STATUS(3字节) + DATA(3字节) = 6 字节
-      // 第 2-N 个样本：STATUS(1字节) + DATA(3字节) = 4 字节
-      
       let offset = 0;
       
       while (offset < payload.length) {
@@ -410,18 +445,15 @@ export class DeviceService {
           if (offset === 0) {
               // --- 第一个样本 (6字节) ---
               // 格式: [S0, S1, S2, D0, D1, D2]
-              // 文档指定为小端序: int32_t adc1 = (data[5] << 16) | (data[4] << 8) | data[3];
               if (offset + 6 > payload.length) break;
               
-              // 取后3个字节作为数据，组合成24位整数
-              // D0=payload[3], D1=payload[4], D2=payload[5]
+              // Little Endian: D0=p[3], D1=p[4], D2=p[5]
               val = (payload[offset+5] << 16) | (payload[offset+4] << 8) | payload[offset+3];
               
               offset += 6;
           } else {
               // --- 后续样本 (4字节) ---
               // 格式: [S0, D0, D1, D2]
-              // 文档: int32_t adc_n = (data[offset+3] << 16) | (data[offset+2] << 8) | data[offset+1];
               if (offset + 4 > payload.length) break;
               
               val = (payload[offset+3] << 16) | (payload[offset+2] << 8) | payload[offset+1];
@@ -454,28 +486,31 @@ export class DeviceService {
 
       const filtered = this.dsp.process(uv);
       
-      this.latestData.raw = { timestamp: Date.now(), value: filtered };
-      
-      const bands = this.dsp.getFFT();
-      
-      const eps = 0.1;
-      const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
-      
-      const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
-      const attMetric = (bands.beta + bands.gamma) / totalPower;
+      // 只有在滤波器初始化完成后(不是0)才开始更新UI数据，避免初始的0直线
+      if (filtered !== 0) {
+          this.latestData.raw = { timestamp: Date.now(), value: filtered };
+          
+          const bands = this.dsp.getFFT();
+          
+          const eps = 0.1;
+          const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
+          
+          const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
+          const attMetric = (bands.beta + bands.gamma) / totalPower;
 
-      // 平滑处理
-      const prevRel = this.latestData.metrics.relaxation;
-      const smoothRel = prevRel * 0.92 + Math.min(1.0, relMetric) * 0.08;
-      
-      const smoothAtt = this.latestData.metrics.attention * 0.9 + attMetric * 0.1;
+          // 平滑处理
+          const prevRel = this.latestData.metrics.relaxation;
+          const smoothRel = prevRel * 0.92 + Math.min(1.0, relMetric) * 0.08;
+          
+          const smoothAtt = this.latestData.metrics.attention * 0.9 + attMetric * 0.1;
 
-      this.latestData.bands = bands;
-      this.latestData.metrics = {
-          relaxation: smoothRel,
-          attention: smoothAtt,
-          isMeditating: smoothRel > MEDITATION_THRESHOLD
-      };
+          this.latestData.bands = bands;
+          this.latestData.metrics = {
+              relaxation: smoothRel,
+              attention: smoothAtt,
+              isMeditating: smoothRel > MEDITATION_THRESHOLD
+          };
+      }
   }
 
   // --------------------------------------------------------------------------
@@ -491,6 +526,7 @@ export class DeviceService {
     if (this.isConnected) this.disconnect();
     this.isSimulating = true;
     this.agitationLevel = 0;
+    this.dsp.reset();
     window.addEventListener('devicemotion', this.handleMotion);
     if (this.simulationInterval) clearInterval(this.simulationInterval);
     this.simulationInterval = window.setInterval(() => this.updateSimulation(), 100);
