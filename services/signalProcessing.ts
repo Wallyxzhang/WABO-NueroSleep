@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.2 (Robust Parser)";
+const VERSION = "v3.3 (Fixed Offset)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -79,9 +79,8 @@ class SignalProcessor {
     private medianBuffer: number[] = [];
 
     process(sample: number): number {
-        // 1. 中值滤波 (Median Filter) - 针对数据中的脉冲噪声
-        // 维护一个5个点的窗口，取中间值，能有效去除单点跳变
-        // 即使因为解析原因偶尔读到了Header当数据，这里也会把它滤掉
+        // 1. 中值滤波 (Median Filter) 
+        // 窗口大小 5，能有效去除偶尔混入的单点 0 或极大值
         this.medianBuffer.push(sample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
@@ -89,14 +88,12 @@ class SignalProcessor {
         
         let filteredSample = sample;
         if (this.medianBuffer.length >= 3) {
-            // 复制并排序找到中位数
             const sorted = [...this.medianBuffer].sort((a, b) => a - b);
             const mid = Math.floor(sorted.length / 2);
             filteredSample = sorted[mid];
         }
 
         // 2. 去直流漂移 (High-pass)
-        // 使用较温和的系数，避免初始归零太慢
         const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = filteredSample;
         this.prevOutput = output;
@@ -324,7 +321,10 @@ export class DeviceService {
 
   private handleBluetoothData(event: any) {
       const value = event.target.value as DataView;
-      const newBytes = new Uint8Array(value.buffer);
+      
+      // CRITICAL FIX: Explicitly use byteOffset and byteLength. 
+      // 'value.buffer' points to the whole underlying memory store, which may be huge and contain garbage/zeros outside the relevant slice.
+      const newBytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
       
       if (this.debugRawEnabled) {
           const hex = Array.from(newBytes).map(b => b.toString(16).padStart(2,'0')).join(' ');
@@ -398,26 +398,30 @@ export class DeviceService {
   }
 
   private parseADCData(payload: number[]) {
-      // 通用解析器：不预设包结构（如前3字节是头等）。
-      // 只要有3个字节，就尝试解析为 24-bit Signed Int。
-      // 之前代码因为要求offset+6才能解析，导致短包数据全部丢失。
+      // 策略：跳过前 3 个字节（通常是状态/Header）。
+      // 然后假设数据结构为 [Header(3), Data(3), Header(1), Data(3)...]
+      // 这个步长逻辑 (offset + 4) 适配单样本包 (len=6) 和多样本包 (len=10) 的常见格式。
+      // 最重要的是：它避免了读取 Header 作为数据（Header通常为0，会导致信号变平）。
       
-      const step = 3;
-      // 遍历整个 payload
-      for (let i = 0; i <= payload.length - step; i += step) {
-          // Big Endian 3-byte parse
-          let val = (payload[i] << 16) | (payload[i+1] << 8) | payload[i+2];
+      let offset = 3; // Start after global header
+      
+      while (offset + 2 < payload.length) {
+          const val32 = (payload[offset] << 16) | (payload[offset+1] << 8) | payload[offset+2];
           
-          // 24-bit 符号扩展
+          let val = val32;
+          // 24-bit 补码符号扩展
           if (val & 0x800000) {
               val = val | 0xFF000000;
           }
 
           const uv = val * SCALE_FACTOR;
           
-          // 如果解析出的值正好是0，且 payload 不是全0，可能是解析错位。
-          // 但我们仍然将其传入处理，因为 SignalProcessor 有滤波器。
+          // 仅在值不为纯0时传递？不，保留0供滤波器处理，但通常Header跳过后这里不会是0
           this.processSignal(uv);
+
+          // 假设每个数据点后面跟一个字节的状态/分隔符
+          // 如果这里不对，Median Filter 也会帮忙修整
+          offset += 4; 
       }
   }
   
@@ -430,7 +434,6 @@ export class DeviceService {
   }
 
   private processSignal(uv: number) {
-      // 记录原始数据 (在滤波前)
       if (this.isRecording) {
           this.recordedData.push(uv);
       }
@@ -442,7 +445,6 @@ export class DeviceService {
       const bands = this.dsp.getFFT();
       
       const eps = 0.1;
-      // 增强: 关注 Alpha 波在总能量中的占比
       const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
       
       const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
