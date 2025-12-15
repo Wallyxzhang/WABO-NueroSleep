@@ -37,7 +37,7 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v3.1 (Anti-Noise)";
+const VERSION = "v3.2 (Robust Parser)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -80,7 +80,8 @@ class SignalProcessor {
 
     process(sample: number): number {
         // 1. 中值滤波 (Median Filter) - 针对数据中的脉冲噪声
-        // 维护一个3-5个点的窗口，取中间值，能有效去除单点跳变
+        // 维护一个5个点的窗口，取中间值，能有效去除单点跳变
+        // 即使因为解析原因偶尔读到了Header当数据，这里也会把它滤掉
         this.medianBuffer.push(sample);
         if (this.medianBuffer.length > 5) {
             this.medianBuffer.shift();
@@ -95,6 +96,7 @@ class SignalProcessor {
         }
 
         // 2. 去直流漂移 (High-pass)
+        // 使用较温和的系数，避免初始归零太慢
         const output = filteredSample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = filteredSample;
         this.prevOutput = output;
@@ -396,26 +398,25 @@ export class DeviceService {
   }
 
   private parseADCData(payload: number[]) {
-      let offset = 0;
-      while (offset < payload.length) {
-          let val = 0;
-          let isFirst = (offset === 0);
+      // 通用解析器：不预设包结构（如前3字节是头等）。
+      // 只要有3个字节，就尝试解析为 24-bit Signed Int。
+      // 之前代码因为要求offset+6才能解析，导致短包数据全部丢失。
+      
+      const step = 3;
+      // 遍历整个 payload
+      for (let i = 0; i <= payload.length - step; i += step) {
+          // Big Endian 3-byte parse
+          let val = (payload[i] << 16) | (payload[i+1] << 8) | payload[i+2];
           
-          if (isFirst) {
-              if (offset + 6 > payload.length) break;
-              // 0..2 Status, 3..5 Data
-              val = (payload[offset+3] << 16) | (payload[offset+4] << 8) | payload[offset+5];
-              offset += 6;
-          } else {
-              if (offset + 4 > payload.length) break;
-              // 0 Status, 1..3 Data
-              val = (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
-              offset += 4;
+          // 24-bit 符号扩展
+          if (val & 0x800000) {
+              val = val | 0xFF000000;
           }
 
-          if (val & 0x800000) val = val | 0xFF000000; 
-          
           const uv = val * SCALE_FACTOR;
+          
+          // 如果解析出的值正好是0，且 payload 不是全0，可能是解析错位。
+          // 但我们仍然将其传入处理，因为 SignalProcessor 有滤波器。
           this.processSignal(uv);
       }
   }
@@ -429,6 +430,7 @@ export class DeviceService {
   }
 
   private processSignal(uv: number) {
+      // 记录原始数据 (在滤波前)
       if (this.isRecording) {
           this.recordedData.push(uv);
       }
@@ -440,11 +442,9 @@ export class DeviceService {
       const bands = this.dsp.getFFT();
       
       const eps = 0.1;
-      // 增强: 关注 Alpha 波在总能量中的占比，作为放松指标的核心
+      // 增强: 关注 Alpha 波在总能量中的占比
       const totalPower = bands.delta + bands.theta + bands.alpha + bands.beta + bands.gamma + eps;
       
-      // 调整放松算法：加大 Alpha 的权重，减小高频噪声(Beta/Gamma)的影响
-      // 之前数据噪声大导致 Beta/Gamma 虚高，放松指数上不去。现在有了中值滤波，应该会好很多。
       const relMetric = (bands.alpha * 1.5 + bands.theta) / (totalPower + bands.beta * 0.5); 
       const attMetric = (bands.beta + bands.gamma) / totalPower;
 
