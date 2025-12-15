@@ -6,7 +6,7 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw, Disc, Copy, Send, Zap, Eye, AlertTriangle } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw, Disc, Copy, Send, Zap, Eye, AlertTriangle, Power } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); 
@@ -29,8 +29,7 @@ const App: React.FC = () => {
   // 协议调试
   const [debugRaw, setDebugRaw] = useState(false);
   const [ignoreCRC, setIgnoreCRC] = useState(false);
-  const [cmdMode, setCmdMode] = useState<'HEX' | 'ASCII'>('HEX');
-  const [cmdInput, setCmdInput] = useState("02");
+  const [cmdInput, setCmdInput] = useState("60 00 00"); // Default to Auto Config payload
 
   const intervalRef = useRef<number | null>(null);
   const lastVoiceTime = useRef<number>(0);
@@ -139,14 +138,18 @@ const App: React.FC = () => {
     }
   };
   
-  const handleSendCommand = async () => {
-      if (cmdMode === 'HEX') {
-          await signalProcessor.sendHexCommand(cmdInput);
-      } else {
-          await signalProcessor.sendASCIICommand(cmdInput);
-      }
+  const handleSendHex = async () => {
+      await signalProcessor.sendHexCommand(cmdInput);
   };
   
+  const handleAutoConfig = async () => {
+      await signalProcessor.performAutoConfig();
+  };
+
+  const handleStopDevice = async () => {
+      await signalProcessor.sendStop();
+  };
+
   const toggleRawDebug = () => {
       const newVal = !debugRaw;
       setDebugRaw(newVal);
@@ -331,24 +334,18 @@ const App: React.FC = () => {
         <div className="flex flex-col border-b border-slate-700">
             {/* 上半部分：标题和状态栏 */}
             <div className="flex justify-between items-center px-4 py-2 bg-slate-800">
-                <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> 调试 v2.8</span>
+                <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> 调试 v3.0</span>
                 <div className="flex gap-2 items-center">
                     {/* 指令输入区域 */}
                     <div className="flex items-center bg-slate-900 rounded border border-slate-700 mr-2">
-                        <button 
-                            onClick={() => setCmdMode(m => m === 'HEX' ? 'ASCII' : 'HEX')}
-                            className="px-2 py-1 text-[10px] bg-slate-800 border-r border-slate-700 text-slate-300 w-12"
-                        >
-                            {cmdMode}
-                        </button>
                         <input 
                         type="text" 
                         value={cmdInput} 
                         onChange={(e) => setCmdInput(e.target.value)}
                         className="bg-transparent text-white w-24 px-2 py-1 outline-none uppercase placeholder-slate-600"
-                        placeholder={cmdMode === 'HEX' ? "02" : "b"}
+                        placeholder="AA BB ..."
                         />
-                        <button onClick={handleSendCommand} className="p-1 hover:text-sky-400 border-l border-slate-700"><Send size={12}/></button>
+                        <button onClick={handleSendHex} className="p-1 hover:text-sky-400 border-l border-slate-700" title="发送原始HEX"><Send size={12}/></button>
                     </div>
                     
                     <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white ml-2"><X size={16}/></button>
@@ -357,13 +354,33 @@ const App: React.FC = () => {
 
             {/* 下半部分：高级工具栏 */}
             <div className="flex gap-2 px-4 py-1.5 bg-slate-800/50 overflow-x-auto">
+                 {/* Auto Config 按钮 */}
+                 <button 
+                    onClick={handleAutoConfig}
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-sky-600 hover:bg-sky-500 text-white border border-sky-500"
+                    title="一键初始化 (0x60)"
+                 >
+                    <Zap size={12}/> Auto Start
+                 </button>
+
+                 {/* Stop 按钮 */}
+                 <button 
+                    onClick={handleStopDevice}
+                    className="flex items-center gap-1 px-2 py-1 rounded text-xs bg-red-600/30 hover:bg-red-600/50 text-red-300 border border-red-500"
+                    title="停止采集 (STOP)"
+                 >
+                    <Power size={12}/> Stop
+                 </button>
+
+                 <div className="w-px h-4 bg-slate-700 mx-1"></div>
+
                  {/* 强制解析开关 */}
                  <button 
                     onClick={toggleIgnoreCRC}
                     className={`flex items-center gap-1 px-2 py-1 rounded text-xs border ${ignoreCRC ? 'bg-amber-500/20 border-amber-500 text-amber-400' : 'bg-slate-700 border-slate-600 text-slate-400'}`}
                     title="忽略CRC错误"
                  >
-                    <AlertTriangle size={12}/> 强制解析 {ignoreCRC ? "ON" : "OFF"}
+                    <AlertTriangle size={12}/> CRC {ignoreCRC ? "NO" : "OK"}
                  </button>
 
                  {/* 原始数据嗅探 */}
@@ -372,7 +389,7 @@ const App: React.FC = () => {
                     className={`flex items-center gap-1 px-2 py-1 rounded text-xs border ${debugRaw ? 'bg-sky-500/20 border-sky-500 text-sky-400' : 'bg-slate-700 border-slate-600 text-slate-400'}`}
                     title="显示原始 HEX 数据"
                  >
-                    <Eye size={12}/> 嗅探 {debugRaw ? "ON" : "OFF"}
+                    <Eye size={12}/> {debugRaw ? "Raw" : "Log"}
                  </button>
 
                  <div className="w-px h-4 bg-slate-700 mx-1"></div>
@@ -381,13 +398,13 @@ const App: React.FC = () => {
                     onClick={toggleRecording} 
                     className={`flex items-center gap-1 px-2 py-1 rounded text-xs text-white border ${isRecording ? 'bg-red-600 border-red-500 animate-pulse' : 'bg-slate-700 border-slate-600 hover:bg-slate-600'}`}
                  >
-                    {isRecording ? <><Copy size={12}/> 停止</> : <><Disc size={12}/> 录制</>}
+                    {isRecording ? <><Copy size={12}/> Stop</> : <><Disc size={12}/> Rec</>}
                  </button>
             </div>
         </div>
 
         <div className="h-40 overflow-y-auto p-4 space-y-1 font-mono text-[11px] leading-tight">
-            {logs.length === 0 && <span className="text-slate-600">等待数据... 请开启“嗅探”查看原始字节。</span>}
+            {logs.length === 0 && <span className="text-slate-600">等待数据... 连接后会自动执行 AutoStart (0x60)。</span>}
             {logs.map((log, i) => (
                 <div key={i} className="break-all border-b border-slate-800/30 pb-1">{log}</div>
             ))}
