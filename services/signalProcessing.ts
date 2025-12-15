@@ -2,7 +2,7 @@ import { FrequencyBands, AnalysisMetrics, EEGDataPoint } from '../types';
 import { MEDITATION_THRESHOLD } from '../constants';
 
 // --------------------------------------------------------------------------
-// Web Bluetooth Interfaces
+// Web Bluetooth 接口定义
 // --------------------------------------------------------------------------
 
 interface BluetoothDevice extends EventTarget {
@@ -34,24 +34,30 @@ interface BluetoothRemoteGATTCharacteristic extends EventTarget {
 }
 
 // --------------------------------------------------------------------------
-// Configuration
+// 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v2.6 (Hex Commander)";
+const VERSION = "v2.7 (CRC Check & AutoStart)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Write
-const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Notify
+const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // 写入特征 (Write)
+const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // 通知特征 (Notify)
 
+// ADS1299 转换系数 (Gain=24, Vref=4.5V/2?) 
+// 根据硬件不同可能需要微调，目前保持原设定
 const SCALE_FACTOR = (2.454 / (12 * 8388608)) * 1000000;
 const SAMPLE_RATE = 250; 
 const FFT_SIZE = 256; 
 
 // --------------------------------------------------------------------------
-// Helpers
+// 辅助函数
 // --------------------------------------------------------------------------
 
 export type LogCallback = (msg: string) => void;
 
+/**
+ * 计算 CRC8 校验码
+ * 用于验证数据包的完整性
+ */
 function calculateCRC8(data: Uint8Array | number[]): number {
   let crc = 0x00;
   for (let i = 0; i < data.length; i++) {
@@ -67,13 +73,17 @@ function calculateCRC8(data: Uint8Array | number[]): number {
   return crc;
 }
 
+/**
+ * 信号处理器
+ * 负责滤波和 FFT 变换
+ */
 class SignalProcessor {
     private buffer: number[] = [];
     private prevInput: number = 0;
     private prevOutput: number = 0;
 
+    // 预处理：去直流漂移 (High-pass filter)
     process(sample: number): number {
-        // DC Blocker (High-pass filter at ~0.5Hz)
         const output = sample - this.prevInput + 0.995 * this.prevOutput;
         this.prevInput = sample;
         this.prevOutput = output;
@@ -85,14 +95,15 @@ class SignalProcessor {
         return output;
     }
 
+    // 计算 FFT 频谱能量
     getFFT(): FrequencyBands {
         if (this.buffer.length < FFT_SIZE) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 };
         
-        // Hanning Window
+        // 汉宁窗 (Hanning Window) - 减少频谱泄漏
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
         const mags = new Float32Array(FFT_SIZE / 2);
         
-        // DFT Calculation
+        // 离散傅里叶变换 (DFT)
         for (let k = 0; k < FFT_SIZE / 2; k++) {
              let real = 0; let imag = 0;
              for (let n = 0; n < FFT_SIZE; n++) {
@@ -100,11 +111,13 @@ class SignalProcessor {
                  real += windowed[n] * Math.cos(theta);
                  imag += windowed[n] * Math.sin(theta);
              }
-             // FIXED: Normalize FFT magnitude by dividing by (N/2)
+             // 归一化幅度: 乘以2除以N，得到真实的微伏(uV)值
              mags[k] = (2 * Math.sqrt(real * real + imag * imag)) / FFT_SIZE;
         }
         
-        const res = SAMPLE_RATE / FFT_SIZE; // ~0.97 Hz per bin
+        const res = SAMPLE_RATE / FFT_SIZE; // 频率分辨率 ~0.97 Hz
+        
+        // 计算特定频段的平均功率
         const getPower = (minHz: number, maxHz: number) => {
             const minBin = Math.floor(minHz / res);
             const maxBin = Math.ceil(maxHz / res);
@@ -128,7 +141,7 @@ class SignalProcessor {
 }
 
 // --------------------------------------------------------------------------
-// Device Service
+// 蓝牙设备服务类
 // --------------------------------------------------------------------------
 
 export class DeviceService {
@@ -159,7 +172,7 @@ export class DeviceService {
   
   private retryMode: number = 1; 
 
-  // Data Recording for Analysis
+  // 数据录制功能
   private isRecording: boolean = false;
   private recordedData: number[] = [];
 
@@ -177,7 +190,7 @@ export class DeviceService {
   public getDataSnapshot() { return this.latestData; }
 
   // --------------------------------------------------------------------------
-  // Recording API
+  // 录制 API
   // --------------------------------------------------------------------------
   public startRecording() {
       this.isRecording = true;
@@ -189,14 +202,14 @@ export class DeviceService {
       this.isRecording = false;
       this.log(`>>> 录制结束。共采集 ${this.recordedData.length} 个点。`);
       const json = JSON.stringify(this.recordedData);
-      console.log("Recorded Data:", json); // Dump to console in case clipboard fails
+      console.log("Recorded Data:", json);
       return json;
   }
 
   public getIsRecording() { return this.isRecording; }
 
   // --------------------------------------------------------------------------
-  // Connect Logic
+  // 连接逻辑
   // --------------------------------------------------------------------------
 
   public async connect(): Promise<boolean> {
@@ -236,7 +249,13 @@ export class DeviceService {
       this.log("等待通道稳定 (1秒)...");
       await new Promise(resolve => setTimeout(resolve, 1000));
 
+      // 1. 发送握手
       await this.performHandshake();
+
+      // 2. 自动发送开始指令 (许多芯片需要此指令开始推流)
+      this.log(">>> 自动发送启动指令 (0x02)...");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await this.sendRawByte(0x02);
       
       return true;
 
@@ -257,6 +276,7 @@ export class DeviceService {
       let idBytes = [0x00, 0x00, 0x00];
       let methodStr = "Default";
 
+      // 策略选择
       if (this.retryMode === 0) {
           const match = name.match(/([0-9A-F]{6})$/i);
           if (match) {
@@ -282,6 +302,7 @@ export class DeviceService {
           }
       }
 
+      // 构建数据包: 0xAA [Func=B0] [Len=3] [ID...] [CRC] 0xBB
       const payloadForCrc = [0xB0, 0xB0, 0x03, ...idBytes];
       const crc = calculateCRC8(new Uint8Array(payloadForCrc));
       const packet = new Uint8Array([0xAA, ...payloadForCrc, crc, 0xBB]);
@@ -298,15 +319,14 @@ export class DeviceService {
 
   public async retryHandshake() {
       this.retryMode = (this.retryMode + 1) % 3;
-      this.log(`>>> 尝试握手策略 #${this.retryMode}`);
+      this.log(`>>> 切换握手策略 #${this.retryMode} 并重试`);
       await this.performHandshake();
   }
 
-  // Debug Method: Send arbitrary hex string or raw bytes
+  // 发送自定义 Hex 命令
   public async sendHexCommand(hex: string) {
       if (!this.rxChar) return;
       
-      // Clean string
       const cleanHex = hex.replace(/[^0-9A-Fa-f]/g, '');
       if (cleanHex.length % 2 !== 0) {
           this.log("错误: Hex 长度必须是偶数");
@@ -318,7 +338,7 @@ export class DeviceService {
           bytes[i / 2] = parseInt(cleanHex.substring(i, i + 2), 16);
       }
       
-      this.log(`TX [MANUAL] >>> ${Array.from(bytes).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`);
+      this.log(`TX [手动] >>> ${Array.from(bytes).map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ')}`);
       try {
           await this.rxChar.writeValue(bytes);
       } catch(e) {
@@ -330,7 +350,7 @@ export class DeviceService {
       if (!this.rxChar) return;
       try {
           await this.rxChar.writeValue(new Uint8Array([byte]));
-          this.log(`TX [RAW] >>> ${byte.toString(16).padStart(2,'0').toUpperCase()}`);
+          this.log(`TX [指令] >>> ${byte.toString(16).padStart(2,'0').toUpperCase()}`);
       } catch(e) {
            this.log(`写入错误: ${e}`);
       }
@@ -348,16 +368,16 @@ export class DeviceService {
     this.server = null;
     this.isConnected = false;
     this.rawBuffer = [];
-    this.log("已断开");
+    this.log("蓝牙已断开");
   }
 
   private onDisconnected() {
-    this.log("蓝牙已断开");
+    this.log("蓝牙连接丢失");
     this.isConnected = false;
   }
 
   // --------------------------------------------------------------------------
-  // Data Parsing
+  // 数据解析 (核心逻辑)
   // --------------------------------------------------------------------------
 
   private handleBluetoothData(event: any) {
@@ -369,49 +389,95 @@ export class DeviceService {
   }
 
   private processRawBuffer() {
+      // 循环处理缓冲区，直到数据不足以构成一个包
       while (this.rawBuffer.length > 0) {
+          // 1. 寻找帧头 0xAA
           const startIdx = this.rawBuffer.indexOf(0xAA);
           if (startIdx === -1) {
-              this.rawBuffer = []; 
+              this.rawBuffer = []; // 没有帧头，丢弃所有数据
               return;
           }
           if (startIdx > 0) {
-              this.rawBuffer.splice(0, startIdx); 
+              this.rawBuffer.splice(0, startIdx); // 丢弃帧头前面的垃圾数据
           }
 
-          if (this.rawBuffer.length < 4) return; 
+          // 2. 检查最小长度 (AA Func Len ... CRC BB) 至少 5 字节
+          if (this.rawBuffer.length < 5) return; 
 
-          const len = this.rawBuffer[3];
-          const frameSize = 6 + len; 
+          const len = this.rawBuffer[3]; // 数据载荷长度
+          const frameSize = 6 + len; // 总帧长 = Header(1) + Func(1) + Len(1) + Data(0) + Payload(len) + CRC(1) + Tail(1) -- wait, protocol check
+          // 协议结构: AA [Func] [Register/Type] [Len] [Payload...] [CRC] BB ?
+          // 根据之前日志 "RX FUNC=20 LEN=1", 结构似乎是:
+          // Byte 0: AA
+          // Byte 1: Func (e.g., B0, 20, F1)
+          // Byte 2: sub-func? or just part of payload? 
+          // 让我们看之前的发送: AA B0 B0 03 ...
+          // Byte 0: AA
+          // Byte 1: Func (B0)
+          // Byte 2: SubFunc/Reg (B0) ? 
+          // Byte 3: Len (03)
+          
+          // 修正协议解析逻辑：基于 TX 包结构 "AA B0 B0 03 ... CRC BB"
+          // Byte 0: AA
+          // Byte 1: Func
+          // Byte 2: Sub/Reg
+          // Byte 3: Len
+          // ... Payload (Len bytes) ...
+          // Byte X: CRC
+          // Byte Y: BB
+          // 总长度 = 4 (Header部分) + Len + 2 (CRC+Tail) = 6 + Len
+          
+          if (this.rawBuffer.length < frameSize) return; // 数据包不完整，等待下一包
 
-          if (this.rawBuffer.length < frameSize) return; 
-
+          // 3. 检查帧尾 0xBB
           if (this.rawBuffer[frameSize - 1] !== 0xBB) {
+              // 帧尾不对，可能是假头，丢弃当前 0xAA，继续寻找
               this.rawBuffer.shift(); 
               continue; 
           }
 
+          // 4. CRC 校验 (关键修复: 防止读取垃圾数据)
+          // 校验范围: 从 Func 到 Payload 结束 (不含 AA 和 BB)
+          // 对应索引: 1 到 frameSize - 3
+          const dataForCrc = this.rawBuffer.slice(1, frameSize - 2); 
+          const receivedCrc = this.rawBuffer[frameSize - 2];
+          const calculatedCrc = calculateCRC8(dataForCrc);
+
+          if (receivedCrc !== calculatedCrc) {
+               this.log(`CRC 校验失败! Recv:${receivedCrc.toString(16)} Calc:${calculatedCrc.toString(16)}`);
+               this.rawBuffer.shift(); // 丢弃坏包
+               continue;
+          }
+
+          // 5. 解析有效载荷
           const func = this.rawBuffer[1];
           const payload = this.rawBuffer.slice(4, 4 + len);
           
           if (func === 0xF0 || func === 0xF1) {
+              // 脑电波形数据
               this.parseSamples(payload);
+          } else if (func >= 0x20 && func <= 0x39) {
+              // 寄存器数据 (Log it to know device state)
+              // 不需要显示太多，避免刷屏
+              // this.log(`RX 寄存器 [${func.toString(16)}]`);
           } else if (func === 0xEE) {
-               // Heartbeat
+               // 心跳包
           } else {
-              // Log specific register dumps to help debug
-              this.log(`RX FUNC=${func.toString(16)} LEN=${len} PL=${Array.from(payload).map(x=>x.toString(16)).join('')}`);
+              this.log(`RX 未知指令 FUNC=${func.toString(16)} LEN=${len}`);
           }
 
+          // 移除已处理的数据包
           this.rawBuffer.splice(0, frameSize);
       }
   }
 
   private parseSamples(payload: number[]) {
+      // 24位 EEG 数据解析 (Big Endian)
       for (let i = 0; i < payload.length; i += 3) {
           if (i + 2 >= payload.length) break;
           
           let val = (payload[i] << 16) | (payload[i+1] << 8) | payload[i+2];
+          // 补码处理 (24-bit signed)
           if (val & 0x800000) val = val - 0x1000000;
           
           const uv = val * SCALE_FACTOR;
@@ -420,8 +486,6 @@ export class DeviceService {
   }
 
   private processSignal(uv: number) {
-      // Record raw data before filter (or after? Let's record after DC blocker to be useful)
-      // Actually, for analysis, let's record the value coming INTO the DSP loop (the calibrated uV)
       if (this.isRecording) {
           this.recordedData.push(uv);
       }
@@ -450,7 +514,7 @@ export class DeviceService {
   }
 
   // --------------------------------------------------------------------------
-  // Simulation
+  // 模拟模式
   // --------------------------------------------------------------------------
   public async requestMotionPermission(): Promise<boolean> {
       if (typeof (DeviceMotionEvent as any) !== 'undefined' && typeof (DeviceMotionEvent as any).requestPermission === 'function') {

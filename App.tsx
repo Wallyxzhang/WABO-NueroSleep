@@ -18,15 +18,15 @@ const App: React.FC = () => {
   const [bands, setBands] = useState<FrequencyBands>({ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0 });
   const [metrics, setMetrics] = useState<AnalysisMetrics>({ attention: 0, relaxation: 0, isMeditating: false });
 
-  // Debug Logs
+  // 调试日志状态
   const [showDebug, setShowDebug] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
   
-  // Recording State
+  // 录制状态
   const [isRecording, setIsRecording] = useState(false);
   
-  // Manual Command
+  // 手动指令
   const [hexCmd, setHexCmd] = useState("02");
 
   const intervalRef = useRef<number | null>(null);
@@ -34,7 +34,7 @@ const App: React.FC = () => {
 
   const t = TRANSLATIONS[language];
 
-  // Initialize Logger
+  // 初始化日志监听
   useEffect(() => {
       signalProcessor.setLogger((msg) => {
           setLogs(prev => {
@@ -45,7 +45,7 @@ const App: React.FC = () => {
       });
   }, []);
 
-  // Auto scroll logs
+  // 自动滚动日志
   useEffect(() => {
       if (showDebug && logsEndRef.current) {
           logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
@@ -112,8 +112,8 @@ const App: React.FC = () => {
     }
 
     if (!isDeviceConnected) {
-        setLogs([]); // Clear logs on new connection attempt
-        setShowDebug(true); // Auto show logs on connect
+        setLogs([]); // 清空日志
+        setShowDebug(true); // 自动打开控制台
         try {
             const success = await signalProcessor.connect();
             if (success) {
@@ -151,7 +151,7 @@ const App: React.FC = () => {
   const toggleRecording = () => {
       if (isRecording) {
           const data = signalProcessor.stopRecording();
-          // Copy to clipboard
+          // 复制到剪贴板
           navigator.clipboard.writeText(data).then(() => {
               alert("数据已复制到剪贴板！请粘贴发送。");
           }).catch(err => {
@@ -319,7 +319,7 @@ const App: React.FC = () => {
       {/* 开发者调试台 - 浮动在底部 */}
       <div className={`fixed bottom-0 left-0 right-0 bg-black/95 text-green-400 font-mono text-xs transition-transform duration-300 z-[100] border-t border-slate-700 ${showDebug ? 'translate-y-0' : 'translate-y-full'}`}>
         <div className="flex justify-between items-center px-4 py-2 bg-slate-800 border-b border-slate-700">
-            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG v2.6</span>
+            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> 调试控制台 v2.7</span>
             <div className="flex gap-2 items-center">
                  <div className="flex items-center bg-slate-900 rounded border border-slate-700 mr-2">
                     <input 
@@ -332,20 +332,20 @@ const App: React.FC = () => {
                     <button onClick={handleSendHex} className="p-1 hover:text-sky-400 border-l border-slate-700"><Send size={12}/></button>
                  </div>
                  
-                 <button onClick={() => handleQuickCommand(0x02)} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600" title="发送 0x02 (Start)">
-                    CMD 02
+                 <button onClick={() => handleQuickCommand(0x02)} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600" title="发送 0x02 (启动)">
+                    启动 (02)
                  </button>
                  
                 <button 
                   onClick={toggleRecording} 
                   className={`flex items-center gap-1 px-2 py-1 rounded text-xs text-white border ${isRecording ? 'bg-red-600 border-red-500 animate-pulse' : 'bg-slate-700 border-slate-600 hover:bg-slate-600'}`}
                 >
-                   {isRecording ? <><Copy size={12}/> 停止</> : <><Disc size={12}/> 录制</>}
+                   {isRecording ? <><Copy size={12}/> 停止录制</> : <><Disc size={12}/> 开始录制</>}
                 </button>
                 <button 
                   onClick={handleRetryHandshake} 
                   className="flex items-center gap-1 px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600"
-                  title="Retry Handshake"
+                  title="切换握手策略"
                 >
                    <RefreshCw size={12}/>
                 </button>
@@ -366,7 +366,7 @@ const App: React.FC = () => {
           <button 
             onClick={() => setShowDebug(true)}
             className="fixed bottom-4 right-4 p-2 bg-slate-800 rounded-full border border-slate-700 text-slate-500 hover:text-white hover:bg-slate-700 z-50 shadow-lg"
-            title="Open Debug Console"
+            title="打开调试控制台"
           >
             <Terminal size={20} />
           </button>
