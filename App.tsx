@@ -6,7 +6,7 @@ import { MetricCard } from './components/MetricCard';
 import { signalProcessor } from './services/signalProcessing';
 import { AppState, EEGDataPoint, FrequencyBands, AnalysisMetrics, Language } from './types';
 import { HISTORY_LENGTH, UPDATE_INTERVAL_MS, TRANSLATIONS } from './constants';
-import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X } from 'lucide-react';
+import { Play, Pause, Activity, Bluetooth, Languages, Smartphone, Terminal, X, RefreshCw } from 'lucide-react';
 
 const App: React.FC = () => {
   const [language, setLanguage] = useState<Language>('zh'); 
@@ -114,7 +114,7 @@ const App: React.FC = () => {
                 handleStartMonitoring();
             } else {
                 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-                if (isIOS && !navigator.bluetooth) {
+                if (isIOS && !(navigator as any).bluetooth) {
                     alert("iOS 需使用 'Bluefy' 浏览器。");
                 }
             }
@@ -127,6 +127,10 @@ const App: React.FC = () => {
         setIsDeviceConnected(false);
         handleStopMonitoring();
     }
+  };
+
+  const handleRetryHandshake = async () => {
+      await signalProcessor.retryHandshake();
   };
 
   const handleSimulation = async () => {
@@ -284,8 +288,16 @@ const App: React.FC = () => {
       {/* 开发者调试台 - 浮动在底部 */}
       <div className={`fixed bottom-0 left-0 right-0 bg-black/90 text-green-400 font-mono text-xs transition-transform duration-300 z-[100] border-t border-slate-700 ${showDebug ? 'translate-y-0' : 'translate-y-full'}`}>
         <div className="flex justify-between items-center px-4 py-2 bg-slate-800 border-b border-slate-700">
-            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.2</span>
-            <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white"><X size={16}/></button>
+            <span className="flex items-center gap-2 font-bold text-sky-400"><Terminal size={14}/> DEBUG CONSOLE v2.3</span>
+            <div className="flex gap-2">
+                <button 
+                  onClick={handleRetryHandshake} 
+                  className="flex items-center gap-1 px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white border border-slate-600"
+                >
+                   <RefreshCw size={12}/> 重发握手
+                </button>
+                <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white"><X size={16}/></button>
+            </div>
         </div>
         <div className="h-40 overflow-y-auto p-4 space-y-1">
             {logs.length === 0 && <span className="text-slate-600">等待连接或数据...</span>}
