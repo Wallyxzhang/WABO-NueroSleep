@@ -1,11 +1,10 @@
-
 import { FrequencyBands, AnalysisMetrics, EEGDataPoint } from '../types';
 
 // --------------------------------------------------------------------------
 // 配置与常量
 // --------------------------------------------------------------------------
 
-const VERSION = "v4.0 (Zen Master)";
+const VERSION = "v4.1 (Stable CRC)";
 const UART_SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; 
 const UART_TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; 
@@ -18,15 +17,30 @@ const FFT_UPDATE_INTERVAL = 25;
 const PROTOCOL_START = 0xAA;
 const PROTOCOL_END = 0xBB;
 
-/**
- * Log callback type for device status reporting
- */
 type LogCallback = (message: string) => void;
+
+/**
+ * CRC8 计算函数 - 硬件通信的关键
+ */
+function calculateCRC8(data: Uint8Array | number[]): number {
+  let crc = 0x00;
+  for (let i = 0; i < data.length; i++) {
+    crc ^= data[i];
+    for (let j = 0; j < 8; j++) {
+      if (crc & 0x80) {
+        crc = ((crc << 1) ^ 0x07) & 0xFF;
+      } else {
+        crc = (crc << 1) & 0xFF;
+      }
+    }
+  }
+  return crc;
+}
 
 class SignalProcessor {
     private buffer: number[] = [];
     
-    // 滤波器状态：针对 35000uV 的直流偏置，使用更强的二阶高通滤波
+    // 滤波器状态
     private hp_v1: number = 0;
     private hp_v2: number = 0;
     private lpfPrev: number = 0; 
@@ -34,12 +48,10 @@ class SignalProcessor {
     private medianBuffer: number[] = [];
     private lastValidRaw: number | null = null;
 
-    // 伪迹防护：适当放宽以适应用户深呼吸时的电压起伏
     private artifactLockout: number = 0;
     private readonly ARTIFACT_DURATION = 125; 
     private readonly NOISE_THRESHOLD_UV = 1200; 
 
-    // 历史平滑
     private bandHistory: FrequencyBands[] = [];
     private readonly HISTORY_SIZE = 15; 
 
@@ -54,11 +66,8 @@ class SignalProcessor {
         this.artifactLockout = 0;
     }
 
-    /**
-     * 核心处理逻辑：去直流 -> 中值滤波 -> 高通滤波 -> 低通滤波
-     */
     process(sample: number): { filtered: number, quality: number } {
-        // 1. 异常跳变剔除
+        // 1. 异常跳变保护
         let cleanSample = sample;
         if (this.lastValidRaw !== null) {
             if (Math.abs(sample - this.lastValidRaw) > 8000) {
@@ -70,7 +79,7 @@ class SignalProcessor {
             this.lastValidRaw = sample;
         }
 
-        // 2. 中值滤波：去除刺尖噪音
+        // 2. 中值滤波
         this.medianBuffer.push(cleanSample);
         if (this.medianBuffer.length > 5) this.medianBuffer.shift();
         let medSample = cleanSample;
@@ -79,22 +88,21 @@ class SignalProcessor {
             medSample = sorted[Math.floor(sorted.length / 2)];
         }
 
-        // 3. 二阶高通滤波器 (约 1Hz 切断)：专门针对 35000uV 的偏移
-        // 使用 Direct Form II 实现，系数针对 250Hz 采样率优化
+        // 3. 强力高通滤波 (1Hz) 去除直流偏置
         const x = medSample;
         const out = x - 2.0 * this.hp_v1 + this.hp_v2 + (1.9822 * this.hp_v1 - 0.9824 * this.hp_v2);
         this.hp_v2 = this.hp_v1;
         this.hp_v1 = out;
 
-        // 4. 低通滤波 (约 35Hz)：滤除工频和肌肉电
+        // 4. 低通滤波 (35Hz)
         const finalOutput = this.lpfPrev + 0.25 * (out - this.lpfPrev);
         this.lpfPrev = finalOutput;
         
-        // 5. FFT 缓存
+        // 5. FFT Buffer
         this.buffer.push(finalOutput);
         if (this.buffer.length > FFT_SIZE) this.buffer.shift();
 
-        // 6. 质量评估
+        // 6. 质量监测
         if (Math.abs(finalOutput) > this.NOISE_THRESHOLD_UV) {
             this.artifactLockout = this.ARTIFACT_DURATION;
         }
@@ -104,13 +112,9 @@ class SignalProcessor {
         return { filtered: finalOutput, quality };
     }
 
-    /**
-     * 计算相对功率谱密度
-     */
     getSmoothedBands(): FrequencyBands | null {
         if (this.buffer.length < FFT_SIZE) return null;
 
-        // 汉宁窗加窗以减少频谱泄露
         const windowed = this.buffer.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1))));
         const mags = new Float32Array(FFT_SIZE / 2);
         
@@ -173,10 +177,6 @@ class SignalProcessor {
     }
 }
 
-// --------------------------------------------------------------------------
-// 设备服务类
-// --------------------------------------------------------------------------
-
 export class DeviceService {
   private device: any = null;
   private server: any = null;
@@ -207,7 +207,7 @@ export class DeviceService {
   public async connect(): Promise<boolean> {
     if (!(navigator as any).bluetooth) return false;
     try {
-      this.log(`>>> 初始化 ZenMaster 4.0 算法...`);
+      this.log(`>>> 连接设备 ${VERSION}...`);
       this.dsp.reset(); 
       this.device = await (navigator as any).bluetooth.requestDevice({
         filters: [{ namePrefix: 'SILI' }], 
@@ -215,44 +215,91 @@ export class DeviceService {
       });
       this.server = await this.device.gatt.connect();
       this.isConnected = true;
+      
       const service = await this.server.getPrimaryService(UART_SERVICE_UUID);
       this.rxChar = await service.getCharacteristic(UART_RX_CHAR_UUID); 
       const txChar = await service.getCharacteristic(UART_TX_CHAR_UUID); 
+      
       await txChar.startNotifications();
       txChar.addEventListener('characteristicvaluechanged', (e: any) => {
           const val = e.target.value;
           for (let i = 0; i < val.byteLength; i++) this.rawBuffer.push(val.getUint8(i));
           this.processRawBuffer();
       });
+
+      this.log(">>> 发送配置指令 (0x60)");
+      await new Promise(r => setTimeout(r, 500));
       await this.sendFrame(0x60, 0x00, []); // 自动配置
+      await new Promise(r => setTimeout(r, 500));
+      await this.sendFrame(0x60, 0x00, []); // 再发一次确保接收
+
       return true;
     } catch (e: any) {
-      this.log(`连接失败: ${e.message}`);
+      this.log(`连接错误: ${e.message}`);
       return false;
     }
   }
 
   private processRawBuffer() {
+      // 循环处理缓冲区中的所有完整帧
       while (this.rawBuffer.length >= 7) {
-          if (this.rawBuffer[0] !== PROTOCOL_START) { this.rawBuffer.shift(); continue; }
+          // 1. 寻找帧头
+          if (this.rawBuffer[0] !== PROTOCOL_START) { 
+              this.rawBuffer.shift(); 
+              continue; 
+          }
+
+          // 2. 检查长度
           const payloadLen = this.rawBuffer[3];
           const frameSize = 6 + payloadLen; 
-          if (this.rawBuffer.length < frameSize) return; 
-          if (this.rawBuffer[frameSize - 1] !== PROTOCOL_END) { this.rawBuffer.shift(); continue; }
+          
+          if (this.rawBuffer.length < frameSize) return; // 数据不够，等待下次
+
+          // 3. 检查帧尾
+          if (this.rawBuffer[frameSize - 1] !== PROTOCOL_END) { 
+              this.rawBuffer.shift(); // 帧尾不对，滑动窗口
+              continue; 
+          }
+
+          // 4. 解析数据
           const funcCode = this.rawBuffer[1];
           const payload = this.rawBuffer.slice(4, 4 + payloadLen);
-          if (funcCode === 0xF0) this.parseADCData(payload);
+          
+          if (funcCode === 0xF0) {
+              this.parseADCData(payload);
+          } else if (funcCode === 0xEE) {
+              this.log(`设备报错: ${payload[0]}`);
+          }
+
+          // 5. 移出已处理数据
           this.rawBuffer.splice(0, frameSize);
       }
+      
+      // 防止缓冲区无限增长
+      if (this.rawBuffer.length > 2048) this.rawBuffer = [];
   }
 
   private parseADCData(payload: number[]) {
-      let offset = 1;
+      // 0xF0 指令：[Counter(1)] [Ch1(3)] [Ch2(3)] ...
+      let offset = 1; 
       let channelIndex = 0;
+      
       while (offset + 3 <= payload.length) {
+          // 读取24位有符号整数 (Big Endian or Little Endian? Assuming Little Endian based on log data)
+          // 根据日志数据，低字节在前
           const val = (payload[offset+2] << 16) | (payload[offset+1] << 8) | payload[offset];
-          let signedVal = val & 0x800000 ? val | 0xFF000000 : val;
-          if (channelIndex === 0) this.processSignal(signedVal * SCALE_FACTOR);
+          
+          // 补码处理
+          let signedVal = val;
+          if (signedVal & 0x800000) {
+              signedVal = signedVal | 0xFF000000;
+          }
+
+          // 只处理通道 1 (通道 0)
+          if (channelIndex === 0) {
+              this.processSignal(signedVal * SCALE_FACTOR);
+          }
+
           offset += 3;
           channelIndex = (channelIndex + 1) % 2;
       }
@@ -260,6 +307,7 @@ export class DeviceService {
 
   private processSignal(uv: number) {
       if (this.isRecording) this.recordedData.push(uv);
+      
       const { filtered, quality } = this.dsp.process(uv);
       this.sampleCounter++;
       this.latestData.raw = { timestamp: Date.now(), value: filtered };
@@ -271,13 +319,13 @@ export class DeviceService {
               this.latestData.bands = bands;
               // 算法改进：使用 Alpha/Beta 比率作为主要放松指标
               const alphaBetaRatio = bands.alpha / (bands.beta + 0.1);
-              const relScore = Math.min(1.0, alphaBetaRatio / 2.5); // 映射到 0-1
-              const attnScore = Math.min(1.0, bands.beta / 40);
+              const relScore = Math.min(1.0, alphaBetaRatio / 3.0); 
+              const attnScore = Math.min(1.0, bands.beta / 50);
 
               this.latestData.metrics = {
                   relaxation: relScore,
                   attention: attnScore,
-                  isMeditating: relScore > 0.6,
+                  isMeditating: relScore > 0.55,
                   signalQuality: quality
               };
           }
@@ -290,16 +338,21 @@ export class DeviceService {
     this.dsp.reset();
   }
 
+  // 修复：必须计算 CRC，否则硬件不认指令
   public async sendFrame(func: number, addr: number, data: number[] = []) {
       if (!this.rxChar) return;
-      const packet = new Uint8Array([PROTOCOL_START, func, addr, data.length, ...data, 0x00, PROTOCOL_END]);
-      await this.rxChar.writeValue(packet);
+      const payloadForCrc = [func, addr, data.length, ...data];
+      const crc = calculateCRC8(new Uint8Array(payloadForCrc));
+      const packet = new Uint8Array([PROTOCOL_START, ...payloadForCrc, crc, PROTOCOL_END]);
+      try {
+          await this.rxChar.writeValue(packet);
+      } catch (e) {
+          this.log(`发送失败: ${e}`);
+      }
   }
 
   public startRecording() { this.isRecording = true; this.recordedData = []; }
   public stopRecording() { this.isRecording = false; return JSON.stringify(this.recordedData); }
-  
-  // 模拟逻辑保持不变...
   public startSimulation() { this.isSimulating = true; }
   public stopSimulation() { this.isSimulating = false; }
 }
